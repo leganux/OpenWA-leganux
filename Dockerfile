@@ -54,6 +54,8 @@ RUN apt-get update && apt-get install -y \
 # Set Chrome executable path for Puppeteer
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+ENV NODE_ENV=production
+ENV PORT=2785
 
 # Create app user for security
 RUN groupadd -r openwa && useradd -r -g openwa openwa

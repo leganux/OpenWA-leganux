@@ -89,7 +89,8 @@ services:
     ports:
       - '7718:80'
     depends_on:
-      - openwa-api
+      openwa-api:
+        condition: service_healthy
 
   postgres:
     image: postgres:16-alpine

@@ -2,14 +2,16 @@ FROM node:20-alpine AS builder
 
 WORKDIR /app
 
-# Copy package files
-COPY package*.json ./
+# Copy the ROOT package.json one level up so vite.config.ts can resolve
+# new URL('../package.json', import.meta.url) → /package.json
+COPY package.json /package.json
 
-# Install dependencies
+# Copy dashboard package files and install dependencies
+COPY dashboard/package*.json ./
 RUN npm ci --include=dev
 
-# Copy source code
-COPY . .
+# Copy dashboard source code
+COPY dashboard/ .
 
 # Build the app
 RUN npm run build
@@ -21,7 +23,7 @@ FROM nginx:alpine
 COPY --from=builder /app/dist /usr/share/nginx/html
 
 # Copy nginx config
-COPY nginx.conf /etc/nginx/conf.d/default.conf
+COPY dashboard/nginx.conf /etc/nginx/conf.d/default.conf
 
 EXPOSE 80
 

@@ -70,7 +70,8 @@ export class CreateWebhookDto {
   })
   // require_tld:false allows hostnames without a dot (e.g. http://localhost:3000); the SSRF
   // guard still decides whether the host is actually allowed to be delivered to.
-  @IsUrl({ require_tld: false })
+  // allow_underscores:true allows hostnames with underscores (e.g. era_qa.example.com).
+  @IsUrl({ require_tld: false, allow_underscores: true })
   url!: string;
 
   @ApiPropertyOptional({
@@ -127,7 +128,7 @@ export class CreateWebhookDto {
 export class UpdateWebhookDto {
   @ApiPropertyOptional({ description: 'Webhook URL' })
   @IsOptional()
-  @IsUrl({ require_tld: false })
+  @IsUrl({ require_tld: false, allow_underscores: true })
   url?: string;
 
   @ApiPropertyOptional({

@@ -34,6 +34,13 @@ export class WwebjsChats {
         this.host.reportIfPageTransportError(error, 'getChats');
         throw new EngineTransportError('Transport died while listing chats');
       }
+      // A puppeteer page evaluate failure while the WhatsApp Web page is in a transitional state
+      // (e.g. navigation re-inject) surfaces as a raw Error from ExecutionContext.evaluate —
+      // the minified bundle yields "r: r" as the error message. Treat it as a transport/availability
+      // error so it maps to HTTP 503 instead of an opaque 500.
+      if (error instanceof Error && /ExecutionContext|IsolatedWorld/i.test(error.stack ?? '')) {
+        throw new EngineTransportError('Page evaluate failed while listing chats');
+      }
       throw error;
     }
     const summaries: ChatSummary[] = [];

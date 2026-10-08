@@ -2,9 +2,29 @@ import { Injectable, BadRequestException, HttpException, HttpStatus, NotFoundExc
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import { GroupMemberAddMode, IWhatsAppEngine, MediaInput } from '../../engine/interfaces/whatsapp-engine.interface';
 import { assertBase64WithinMediaCap, stripBase64DataUri } from '../message/media-cap.util';
+import { chatKind } from '../../engine/identity/wa-id';
+import { isAddressableParticipant } from '../../engine/identity/wa-id';
 import { SetGroupPictureDto } from './dto/group.dto';
 import { paginate, ListOptions } from '../../common/utils/paginate';
 import { SendPacingService } from '../message/send-pacing.service';
+import { createLogger } from '../../common/services/logger.service';
+import { EngineNotSupportedError } from '../../common/errors/engine-not-supported.error';
+import { EngineThrottledError } from '../../common/errors/engine-throttled.error';
+
+/**
+ * Whether a failed paced write provably contacted nobody, so its reserved budget can go back: a
+ * client or refusal status (400 bad input, 403 refused, 404 no such group, 409 not ready), a 501
+ * for an operation the engine lacks, or a 503 WhatsApp rate limit (EngineThrottledError), which
+ * WhatsApp turned away before it ran. Anything else (a 503 deadline that abandoned an IQ still in
+ * flight, a dropped socket, a dead page) leaves the outcome unknown, and WhatsApp may already have
+ * added the participants, so the batch stays charged.
+ */
+function contactedNobody(error: unknown): boolean {
+  return (
+    error instanceof HttpException &&
+    (error.getStatus() < 500 || error instanceof EngineNotSupportedError || error instanceof EngineThrottledError)
+  );
+}
 
 /**
  * Owns engine access for group operations. Controllers depend on this service instead of
@@ -13,6 +33,8 @@ import { SendPacingService } from '../message/send-pacing.service';
  */
 @Injectable()
 export class GroupService {
+  private readonly logger = createLogger('GroupService');
+
   constructor(
     private readonly engines: EngineRegistry,
     private readonly pacing: SendPacingService,
@@ -23,12 +45,35 @@ export class GroupService {
     return this.engines.require(sessionId);
   }
 
+  /**
+   * Reject participant ids WhatsApp cannot act on, before they reach an engine.
+   *
+   * This lives in the service rather than in ParticipantsDto because the MCP agent tools
+   * (src/core/agent-tools/tools/group.tools.ts) call createGroup and addParticipants directly with a
+   * plain `z.array(z.string())`, so a DTO-only check would leave that path unguarded. Mirrors
+   * ContactService.assertAddressable.
+   *
+   * Runs before pacing on the two paced writes: a batch that can never reach WhatsApp must not draw
+   * on the cold-reachout budget on its way to a 400.
+   */
+  private assertAddressableParticipants(participants: string[]): void {
+    const invalid = participants.filter(p => !isAddressableParticipant(p));
+    if (invalid.length) {
+      throw new BadRequestException(
+        `Not an individual participant id: ${invalid.join(', ')} — pass a phone number, <phone>@c.us or <lid>@lid`,
+      );
+    }
+  }
+
+  /** Every group before a caller applies authorization and pagination. */
+  listGroups(sessionId: string) {
+    return this.getEngine(sessionId).getGroups();
+  }
+
   getGroups(sessionId: string, opts: ListOptions = {}) {
     // getEngine throws synchronously (sync 400 guard); the engine returns the full set and we
     // bound the HTTP response window via paginate().
-    return this.getEngine(sessionId)
-      .getGroups()
-      .then(groups => paginate(groups, opts.limit, opts.offset));
+    return this.listGroups(sessionId).then(groups => paginate(groups, opts.limit, opts.offset));
   }
 
   async getGroupInfo(sessionId: string, groupId: string) {
@@ -44,8 +89,16 @@ export class GroupService {
    * reachout cost as adding them one by one — and is paced accordingly.
    */
   async createGroup(sessionId: string, name: string, participants: string[]) {
-    await this.pacing.assertReachoutAllowed(sessionId, participants);
-    return this.getEngine(sessionId).createGroup(name, participants);
+    this.assertAddressableParticipants(participants);
+    const reservation = await this.pacing.assertReachoutAllowed(sessionId, participants);
+    try {
+      return await this.getEngine(sessionId).createGroup(name, participants);
+    } catch (error) {
+      // A refusal invited nobody, so the reserved budget goes back (whatsapp-web.js always 501s here).
+      // An outcome-unknown failure stays charged.
+      if (contactedNobody(error)) this.pacing.refundGroupReachouts(sessionId, reservation);
+      throw error;
+    }
   }
 
   /**
@@ -54,19 +107,30 @@ export class GroupService {
    * draws on the same cold-reachout budget a first message does.
    */
   async addParticipants(sessionId: string, groupId: string, participants: string[]) {
-    await this.pacing.assertReachoutAllowed(sessionId, participants);
-    return this.getEngine(sessionId).addParticipants(groupId, participants);
+    this.assertAddressableParticipants(participants);
+    const reservation = await this.pacing.assertReachoutAllowed(sessionId, participants);
+    try {
+      return await this.getEngine(sessionId).addParticipants(groupId, participants);
+    } catch (error) {
+      // A refused add contacted nobody. Per-participant failures an engine reports without throwing
+      // stay charged: the batch was attempted. So does an outcome-unknown failure.
+      if (contactedNobody(error)) this.pacing.refundGroupReachouts(sessionId, reservation);
+      throw error;
+    }
   }
 
   removeParticipants(sessionId: string, groupId: string, participants: string[]) {
+    this.assertAddressableParticipants(participants);
     return this.getEngine(sessionId).removeParticipants(groupId, participants);
   }
 
   promoteParticipants(sessionId: string, groupId: string, participants: string[]) {
+    this.assertAddressableParticipants(participants);
     return this.getEngine(sessionId).promoteParticipants(groupId, participants);
   }
 
   demoteParticipants(sessionId: string, groupId: string, participants: string[]) {
+    this.assertAddressableParticipants(participants);
     return this.getEngine(sessionId).demoteParticipants(groupId, participants);
   }
 
@@ -77,13 +141,17 @@ export class GroupService {
   /**
    * Deliberately NOT paced, unlike addParticipants: the people here asked for the contact
    * themselves, so approving (or rejecting) them draws nothing from the cold-reachout budget.
-   * `participants` omitted means every pending request.
+   * `participants` omitted means every pending request — so the shape guard is conditional, not
+   * skipped: these routes take the same participant ids as the writes above, and whatsapp-web.js
+   * feeds a named requester straight to `requesterIds.map(createWid)`.
    */
   approveGroupMembershipRequests(sessionId: string, groupId: string, participants?: string[]) {
+    if (participants) this.assertAddressableParticipants(participants);
     return this.getEngine(sessionId).approveGroupMembershipRequests(groupId, participants);
   }
 
   rejectGroupMembershipRequests(sessionId: string, groupId: string, participants?: string[]) {
+    if (participants) this.assertAddressableParticipants(participants);
     return this.getEngine(sessionId).rejectGroupMembershipRequests(groupId, participants);
   }
 
@@ -113,22 +181,47 @@ export class GroupService {
    * client error it is.
    */
   getGroupJoinInfo(sessionId: string, inviteCode: string) {
-    if (!inviteCode?.trim()) {
-      throw new BadRequestException('An invite code is required');
-    }
-    return this.getEngine(sessionId).getGroupJoinInfo(inviteCode.trim());
+    const code = this.requireInviteCode(inviteCode);
+    return this.getEngine(sessionId).getGroupJoinInfo(code);
   }
 
+  /** Same rule as the preview, so a code that previews also joins. */
   joinGroupViaInviteCode(sessionId: string, inviteCode: string) {
-    return this.getEngine(sessionId).joinGroupViaInviteCode(inviteCode);
+    const code = this.requireInviteCode(inviteCode);
+    return this.getEngine(sessionId).joinGroupViaInviteCode(code);
+  }
+
+  private requireInviteCode(inviteCode: string): string {
+    const code = inviteCode?.trim();
+    if (!code) {
+      throw new BadRequestException('An invite code is required');
+    }
+    return code;
+  }
+
+  /**
+   * Refuse an id that does not name a group before it reaches an engine.
+   *
+   * These three routes reuse the ACCOUNT's profile-picture primitives, and Baileys omits the `target`
+   * attribute whenever the jid it is handed is the account's own — so a 1:1 id passed where a group id
+   * belongs replaced or permanently deleted the account's own avatar and answered 200, while
+   * whatsapp-web.js refused the same input through requireGroupChat. Guarded here rather than in either
+   * adapter so both engines agree, and so no engine ever sees the wrong kind of id.
+   */
+  private assertGroupId(groupId: string): void {
+    if (chatKind(groupId) !== 'group') {
+      throw new BadRequestException(`${groupId} is not a group id`);
+    }
   }
 
   /** Read the group's picture URL, or null when it has none. Groups reuse the profile-picture read. */
   getGroupPicture(sessionId: string, groupId: string): Promise<string | null> {
+    this.assertGroupId(groupId);
     return this.getEngine(sessionId).getProfilePicture(groupId);
   }
 
   setGroupPicture(sessionId: string, groupId: string, dto: SetGroupPictureDto): Promise<void> {
+    this.assertGroupId(groupId);
     const base64 = stripBase64DataUri(dto.base64);
     if (!dto.url && !base64) {
       throw new BadRequestException('Either url or base64 must be provided');
@@ -146,6 +239,7 @@ export class GroupService {
   }
 
   deleteGroupPicture(sessionId: string, groupId: string): Promise<void> {
+    this.assertGroupId(groupId);
     return this.getEngine(sessionId).deleteGroupPicture(groupId);
   }
 
@@ -172,7 +266,9 @@ export class GroupService {
    * A failure on the FIRST applied field propagates unchanged (nothing was applied, so the patch
    * simply failed). A failure on a LATER field means the group is now in a mixed state, so the
    * error names the failed field and the ones already applied — the caller can reconcile instead
-   * of guessing which subset took effect. The wrapped error keeps the underlying HTTP status.
+   * of guessing which subset took effect. The wrapped error keeps the underlying HTTP status, and
+   * carries the underlying message only for an HTTP error; any other failure is logged here and
+   * reported as an internal error.
    */
   async updateGroupSettings(
     sessionId: string,
@@ -215,7 +311,16 @@ export class GroupService {
       } catch (error) {
         if (applied.length === 0) throw error;
         const status = error instanceof HttpException ? error.getStatus() : HttpStatus.INTERNAL_SERVER_ERROR;
-        const detail = error instanceof Error ? error.message : String(error);
+        let detail = 'internal error';
+        if (error instanceof HttpException) {
+          detail = error.message;
+        } else {
+          this.logger.error(
+            'Group settings step failed after a partial apply',
+            error instanceof Error ? error.stack : String(error),
+            { sessionId, groupId, field, applied: applied.join(',') },
+          );
+        }
         throw new HttpException(
           `Group settings only partially applied: '${field}' failed (${detail}); already applied: ${applied.join(
             ', ',

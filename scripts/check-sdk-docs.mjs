@@ -21,16 +21,18 @@
  *   - Compares the SET of names in each language's own idiom — Python snake_case, everyone else
  *     camelCase. It does NOT check signatures, descriptions or **OPERATOR** annotations, which carry
  *     information that exists nowhere else and cannot be derived from the source.
- *   - One direction is enough to catch the drift that happened, but both are reported: a documented
- *     method that does not ship is a false promise and worse than an omission.
+ *   - ONE DIRECTION ONLY: shipped → documented. Every failure it can report ends in "which the
+ *     client ships". The reverse — a documented method that no client ships — is a false promise and
+ *     arguably worse than an omission, but nothing here detects it; do not read a green run as
+ *     evidence that the docs promise nothing extra.
  *
  * Lives in ci.yml's lint job rather than sdk-ci.yml for the same reason as the route and event
  * guards: sdk-ci is path-filtered, so a docs-only PR runs none of it.
  *
  * Run locally: `npm run check:sdk-docs`.
  */
-import { readFileSync, readdirSync } from 'node:fs';
-import { join, resolve, dirname } from 'node:path';
+import { readFileSync, readdirSync, realpathSync } from 'node:fs';
+import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -220,6 +222,6 @@ function main() {
   );
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main();
 }

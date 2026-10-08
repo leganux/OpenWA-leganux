@@ -1,6 +1,6 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { ENGINE_CAPABILITY_MATRIX } from './engine-capability-matrix';
+import { engineCapabilityMatrix } from './engine-capability-matrix';
 
 /**
  * Drift invariants for the hand-maintained halves of docs/29-engine-capability-matrix.md.
@@ -16,12 +16,17 @@ import { ENGINE_CAPABILITY_MATRIX } from './engine-capability-matrix';
  * listener at all. Those are exactly the marks a reader triaging backlog work trusts most, so they
  * get a gate.
  *
- * What this gate CANNOT see, and why (do not read a green run as more than it is):
+ * The name-collision half of that is now closed: a second invariant requires the symbol to be
+ * reached THROUGH a library handle, so an adapter method of the same name no longer satisfies it.
+ * It found two rows that a name search had blessed for as long as they existed — Baileys `star`
+ * (`starMessage` goes through `chatModify`) and wwjs `sendSeen` (the `Chat` model method, not the
+ * `Client` one).
+ *
+ * What this gate still CANNOT see, and why (do not read a green run as more than it is):
  *   - Under-mapping. A ✅ row listing four interface methods when the symbol really serves eight
  *     still passes; the check is "the claim has code behind it", not "the claim is exhaustive".
- *   - A library symbol whose name collides with an adapter method of the same name (`logout`,
- *     `createGroup`, …). `this.lifecycle.logout()` is indistinguishable here from `sock.logout()`.
- *   - Direction. Mapping symbol A to interface method B instead of C passes as long as both exist.
+ *   - Direction. Mapping symbol A to interface method B instead of C passes as long as both exist,
+ *     because nothing here resolves a call site back to the interface method enclosing it.
  */
 const DOC = join(__dirname, '..', '..', 'docs', '29-engine-capability-matrix.md');
 const ADAPTER_DIR = join(__dirname, 'adapters');
@@ -38,12 +43,33 @@ function docText(): string {
   return readFileSync(DOC, 'utf8');
 }
 
-/** Adapter sources, comments removed but string literals kept — for finding `.on('event')`. */
-function adapterSourcesWithStrings(): string {
+/**
+ * The engine an adapter file belongs to, or undefined for a module both adapters share. Mirrors the
+ * attribution in engine-parity.spec.ts: an engine prefix, or one of the two engine-specific
+ * unprefixed files.
+ */
+function adapterFileEngine(file: string): Engine | undefined {
+  if (file.startsWith('baileys') || file === 'safe-link-preview.ts') return 'baileys';
+  if (file.startsWith('wwebjs') || file.startsWith('whatsapp-web-js') || file === 'chromium-profile-hygiene.ts') {
+    return 'wwjs';
+  }
+  return undefined;
+}
+
+/**
+ * Adapter sources, one entry per file, comments removed but string literals kept, for finding
+ * `.on('event')`. Given an engine, only that engine's files and the shared ones: a call or listener
+ * in the other engine's adapter says nothing about this one.
+ */
+function adapterFileSources(engine?: Engine): string[] {
   return readdirSync(ADAPTER_DIR)
     .filter(f => f.endsWith('.ts') && !f.endsWith('.spec.ts'))
-    .map(f => stripComments(readFileSync(join(ADAPTER_DIR, f), 'utf8')))
-    .join('\n');
+    .filter(f => engine === undefined || (adapterFileEngine(f) ?? engine) === engine)
+    .map(f => stripComments(readFileSync(join(ADAPTER_DIR, f), 'utf8')));
+}
+
+function adapterSourcesWithStrings(engine?: Engine): string {
+  return adapterFileSources(engine).join('\n');
 }
 
 function stripComments(src: string): string {
@@ -101,9 +127,9 @@ function readEvents(engine: Engine): EventRow[] {
   return rows;
 }
 
-const registeredEvents = new Set(
-  [...adapterSourcesWithStrings().matchAll(/\.on\(\s*'([a-zA-Z][a-zA-Z_.-]*)'/g)].map(m => m[1]),
-);
+function registeredEvents(engine: Engine): Set<string> {
+  return new Set([...adapterSourcesWithStrings(engine).matchAll(/\.on\(\s*'([a-zA-Z][a-zA-Z_.-]*)'/g)].map(m => m[1]));
+}
 
 describe('engine inventory (docs/29 §29.5) — drift invariants', () => {
   // Guards against a parser that silently stops matching: an empty or short parse would make every
@@ -148,12 +174,13 @@ describe('engine inventory (docs/29 §29.5) — drift invariants', () => {
     expect(scrubbed).toMatch(/real\.event/);
     // The real adapter corpus must be non-trivial, or the scan proves nothing.
     expect(adapterSourcesWithStrings().length).toBeGreaterThan(50_000);
-    expect(registeredEvents.size).toBeGreaterThanOrEqual(20);
+    expect(registeredEvents('baileys').size).toBeGreaterThanOrEqual(10);
+    expect(registeredEvents('wwjs').size).toBeGreaterThanOrEqual(10);
   });
 
   describe.each<Engine>(['baileys', 'wwjs'])('%s', engine => {
     it('every ✅/⚙️ exposure mark has the symbol somewhere in adapter CODE, not just a comment', () => {
-      const code = adapterSourcesWithStrings();
+      const code = adapterSourcesWithStrings(engine);
       const unsupported = readInventory(engine)
         .filter(r => r.exposure.startsWith('✅') || r.exposure.startsWith('⚙️'))
         .filter(r => !isUsedInAdapterCode(r.symbol, code))
@@ -161,12 +188,55 @@ describe('engine inventory (docs/29 §29.5) — drift invariants', () => {
       expect(unsupported).toEqual([]);
     });
 
+    /**
+     * The check above asks whether the NAME occurs in adapter code, which our own identically-named
+     * methods satisfy: `getChatLabels` was marked used while `Client.getChatLabels` was never
+     * called, because the adapter defines a method of that name. Two rows were wrong for exactly
+     * that reason — Baileys `star` (starMessage goes through `chatModify({ star })`) and wwjs
+     * `sendSeen` (the adapter calls the `Chat` model method, not the `Client` one).
+     *
+     * So this asks the stronger question: is the symbol reached THROUGH a library handle? The
+     * handle shapes are taken from what the adapters actually do — `this.sock()`/`this.client()`,
+     * `getSocket()`, and any socket/client-shaped local (`sock`, `sourceSock`, `client`) — and a
+     * member may be a reference rather than a call, since `updateMediaMessage` is passed as one.
+     * Casts are tolerated: `(this.client() as unknown as BusinessClient).getLabels()` is a real
+     * call, and so is computed dispatch, `this.client()[op](…)` with the name supplied as a literal
+     * in the same file. The index must be an identifier: a quoted one is a type position such as
+     * `Client['getContacts']`, and a literal used only as a log context is not a dispatch.
+     *
+     * A row that says the adapter does NOT go through the Client method (`not \`Client.getChats\``)
+     * is held to the opposite: the symbol must not be reached, so the disclaimer cannot go stale.
+     */
+    it('every ✅/⚙️ exposure mark is reached through a library handle, not just named', () => {
+      const files = adapterFileSources(engine).map(f => f.replace(/\s+/g, ' '));
+      const code = files.join(' ');
+      const handle =
+        engine === 'wwjs'
+          ? String.raw`(?:\bthis\.client\(\)|\b\w*[Cc]lient\b)`
+          : String.raw`(?:\bthis\.sock\(\)|\bgetSocket\(\)|\b\w*[Ss]ock\b)`;
+      const reached = (symbol: string): boolean => {
+        const s = symbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        if (new RegExp(`${handle}[^;{}]{0,90}?\\.\\s*${s}\\s*[(<.,)\\]]`).test(code)) return true;
+        // computed dispatch through the handle, with the method name supplied as a literal in that file
+        const dispatch = new RegExp(`${handle}\\s*\\[\\s*\\w+\\s*\\]\\s*\\(`);
+        const literal = new RegExp(`['"\`]${s}['"\`]`);
+        return files.some(f => dispatch.test(f) && literal.test(f));
+      };
+      const disclaimed = (row: Row): boolean => row.exposure.includes(`not \`Client.${row.symbol}\``);
+
+      const marked = readInventory(engine).filter(r => r.exposure.startsWith('✅') || r.exposure.startsWith('⚙️'));
+      // Guard the selector: an empty or tiny set would make the assertion vacuous.
+      expect(marked.length).toBeGreaterThan(30);
+      expect(marked.filter(r => reached(r.symbol) === disclaimed(r)).map(r => r.symbol)).toEqual([]);
+    });
+
     it('every interface method named in a ✅ exposure cell is `supported` for this engine', () => {
+      const matrix = engineCapabilityMatrix();
       const offenders: string[] = [];
       for (const row of readInventory(engine)) {
         if (!row.exposure.startsWith('✅')) continue;
         for (const [, method] of row.exposure.matchAll(/`([a-zA-Z][a-zA-Z0-9]*)`/g)) {
-          const entry = ENGINE_CAPABILITY_MATRIX[method];
+          const entry = matrix[method];
           if (!entry) continue; // prose backtick, not an interface method
           if (entry[engine].status !== 'supported') offenders.push(`${row.symbol} → ${method}`);
         }
@@ -175,9 +245,10 @@ describe('engine inventory (docs/29 §29.5) — drift invariants', () => {
     });
 
     it('the ✅ event marks match the listeners the adapters register', () => {
+      const registered = registeredEvents(engine);
       const wrong = readEvents(engine)
-        .filter(row => row.consumed !== registeredEvents.has(row.event))
-        .map(row => `${row.event}: doc=${row.consumed ? '✅' : '❌'} registered=${registeredEvents.has(row.event)}`);
+        .filter(row => row.consumed !== registered.has(row.event))
+        .map(row => `${row.event}: doc=${row.consumed ? '✅' : '❌'} registered=${registered.has(row.event)}`);
       expect(wrong).toEqual([]);
     });
   });

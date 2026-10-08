@@ -1,6 +1,7 @@
 import { useEffect, useRef, useCallback, useState } from 'react';
 import { io, Socket } from 'socket.io-client';
-import { warnIfInsecureHttpUrl } from '../utils/urlSecurity';
+import { API_ORIGIN } from '../services/api';
+import { resolveSocketUrl, warnIfInsecureHttpUrl } from '../utils/urlSecurity';
 
 interface SessionStatusEvent {
   sessionId: string;
@@ -137,11 +138,12 @@ interface ServerErrorFrame {
   message?: string;
 }
 
-// Use current origin for WebSocket (goes through nginx proxy in Docker)
-// Falls back to env var or localhost for development
-const SOCKET_URL = import.meta.env.VITE_WS_URL || window.location.origin;
-// Warn when the WebSocket origin is an insecure http:// URL on a non-localhost host.
-warnIfInsecureHttpUrl(SOCKET_URL, 'VITE_WS_URL');
+// The origin of VITE_WS_URL when set, else of VITE_API_URL (a split-origin build names the API there), else the
+// page's own origin (the single-container setup, or nginx proxying /socket.io in Docker).
+const SOCKET_URL = resolveSocketUrl(import.meta.env.VITE_WS_URL, API_ORIGIN, window.location.origin);
+// Warn when VITE_WS_URL is an insecure http:// or ws:// URL on a non-localhost host; api.ts already warns
+// about VITE_API_URL under its own name.
+if (import.meta.env.VITE_WS_URL) warnIfInsecureHttpUrl(SOCKET_URL, 'VITE_WS_URL');
 
 export function useWebSocket(events: WebSocketEvents = {}) {
   const socketRef = useRef<Socket | null>(null);
@@ -152,6 +154,11 @@ export function useWebSocket(events: WebSocketEvents = {}) {
   // `reconnect_failed` never fires). Lets the UI show a "connection lost" indicator + a manual
   // retry instead of silently going stale.
   const [connectionFailed, setConnectionFailed] = useState(false);
+  // Bumped every time connect() creates a NEW socket instance. The envelope-handler effect below
+  // captures socketRef.current when it runs; without this epoch in its deps, a manual reconnect()
+  // (which swaps in a fresh socket) leaves the new socket with NO 'message' listener while
+  // isConnected still reports true - realtime events stop arriving with no signal anywhere.
+  const [socketEpoch, setSocketEpoch] = useState(0);
 
   const connect = useCallback(() => {
     if (socketRef.current?.connected) return;
@@ -164,6 +171,7 @@ export function useWebSocket(events: WebSocketEvents = {}) {
       return;
     }
 
+    setSocketEpoch(epoch => epoch + 1);
     socketRef.current = io(`${SOCKET_URL}/events`, {
       autoConnect: true,
       reconnection: true,
@@ -355,7 +363,9 @@ export function useWebSocket(events: WebSocketEvents = {}) {
     return () => {
       socket.off('message', handleIncomingMessage);
     };
-  }, [events]);
+    // socketEpoch re-runs this effect for the socket a manual reconnect() swapped in; the cleanup
+    // above detaches the handler from the dead instance first.
+  }, [events, socketEpoch]);
 
   return { isConnected, connectionFailed, reconnect, subscribe, unsubscribe };
 }

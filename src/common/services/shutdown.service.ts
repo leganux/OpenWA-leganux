@@ -2,7 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { createLogger } from './logger.service';
 
 /** Default grace before teardown; capped so a misconfigured value can't exceed a typical SIGKILL window. */
-const DEFAULT_SHUTDOWN_DELAY_MS = 3000;
+export const DEFAULT_SHUTDOWN_DELAY_MS = 3000;
 const MAX_SHUTDOWN_DELAY_MS = 30_000;
 
 @Injectable()
@@ -11,6 +11,7 @@ export class ShutdownService {
   private destroyCallback: (() => Promise<void>) | null = null;
   private shuttingDown = false;
   private shutdownScheduled = false;
+  private tearingDown = false;
 
   /**
    * Set the shutdown callback (called from main.ts after app creation)
@@ -25,6 +26,15 @@ export class ShutdownService {
    */
   isShuttingDown(): boolean {
     return this.shuttingDown;
+  }
+
+  /**
+   * True once the grace has elapsed and teardown has started. Nest keeps the HTTP listener open
+   * until every destroy hook has finished, so the request gate in configure-app.ts refuses new
+   * requests from this point on.
+   */
+  isTearingDown(): boolean {
+    return this.tearingDown;
   }
 
   /** Flip the draining flag (idempotent). Safe to call synchronously from a signal handler. */
@@ -52,6 +62,7 @@ export class ShutdownService {
 
     setTimeout(() => {
       this.logger.log('Initiating shutdown...');
+      this.tearingDown = true;
       const doShutdown = async () => {
         // The exit status mirrors the teardown outcome: 0 when teardown completed, 1 when it
         // failed — an orchestrator (k8s, systemd, docker restart policies) must not read a
@@ -80,9 +91,9 @@ export class ShutdownService {
   /**
    * Bounded, configurable grace (SHUTDOWN_DELAY_MS), capped at 30s. An explicit value always wins.
    * When unset, the default is the full 3s drain window (so a load balancer observes the 503 before
-   * teardown) for EVERY real deployment — including a bare `docker run` or a Kubernetes pod that never
-   * sets NODE_ENV. Only an explicit `development`/`test` skips the window (delay 0), so a
-   * `nest start --watch` hot reload or a dev Ctrl+C is not slowed by a grace it does not need.
+   * teardown) for EVERY real deployment — even an ad-hoc run that never sets NODE_ENV. Only an
+   * explicit `development`/`test` skips the window (delay 0), so a `nest start --watch` hot reload
+   * or a dev Ctrl+C is not slowed by a grace it does not need.
    */
   private resolveDelay(): number {
     const parsed = Number.parseInt(process.env.SHUTDOWN_DELAY_MS ?? '', 10);

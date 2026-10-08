@@ -122,6 +122,21 @@ describe('PluginsService — install / uninstall (real loader + disk)', () => {
     }
   });
 
+  it('preserves a legacy (pre-encoding) ctx.storage file across an in-place package update', async () => {
+    service.install({ buffer: pkg({ version: '1.0.0' }) });
+    const storage = pluginStorage.createPluginStorage('svc-plg');
+    fs.writeFileSync(path.join(pluginsDir, 'svc-plg', 'cursor.json'), JSON.stringify({ lastId: 'msg-7' }));
+
+    await service.updatePackage('svc-plg', pkg({ version: '2.0.0' }));
+
+    expect(await storage.get('cursor')).toEqual({ lastId: 'msg-7' });
+    // The new package's own manifest is never overwritten by the backed-up one.
+    const shipped = JSON.parse(fs.readFileSync(path.join(pluginsDir, 'svc-plg', 'manifest.json'), 'utf8')) as {
+      version: string;
+    };
+    expect(shipped.version).toBe('2.0.0');
+  });
+
   it('updatePackage rejects a package whose id does not match', async () => {
     service.install({ buffer: pkg() });
     await expect(service.updatePackage('svc-plg', pkg({ id: 'other-plg' }))).rejects.toThrow(/does not match/i);
@@ -148,6 +163,25 @@ describe('PluginsService — install / uninstall (real loader + disk)', () => {
     expect(onDisk.version).toBe('1.0.0');
 
     enableSpy.mockRestore();
+  });
+
+  it('keeps the new version when an update finishes during shutdown instead of rolling back', async () => {
+    service.install({ buffer: pkg({ version: '1.0.0' }) });
+    pluginStorage.setPluginEnabledByOperator('svc-plg', true);
+    // Teardown has begun (nothing was enabled yet), then the update of a running plugin reaches its re-enable.
+    await loader.onModuleDestroy();
+    loader.getPlugin('svc-plg')!.status = PluginStatus.ENABLED;
+
+    const dto = await service.updatePackage('svc-plg', pkg({ version: '2.0.0' }));
+
+    expect(dto.version).toBe('2.0.0');
+    const onDisk = JSON.parse(fs.readFileSync(path.join(pluginsDir, 'svc-plg', 'manifest.json'), 'utf8')) as {
+      version: string;
+    };
+    expect(onDisk.version).toBe('2.0.0');
+    expect(fs.existsSync(path.join(pluginsDir, '.svc-plg.bak'))).toBe(false);
+    // The operator decision survives, so the next boot restores the new version.
+    expect(pluginStorage.getPluginEntry('svc-plg')?.enabledByOperator).toBe(true);
   });
 
   it('cleans up the staging + backup dirs after a successful update (swap happened)', async () => {
@@ -242,7 +276,7 @@ describe('PluginsService — install / uninstall (real loader + disk)', () => {
   });
 });
 
-describe('PluginsService — download integrity (optional #sha256 pinning)', () => {
+describe('PluginsService — download integrity + install-URL transport rule', () => {
   let tmpDir: string;
   let pluginsDir: string;
   let loader: PluginLoaderService;
@@ -335,6 +369,49 @@ describe('PluginsService — download integrity (optional #sha256 pinning)', () 
     const dto = await service.installFromUrl('https://plugins.example/svc-plg.zip');
 
     expect(dto.id).toBe('svc-plg');
+  });
+
+  it('rejects a plain http URL without a content pin BEFORE any fetch', async () => {
+    fetchMock.mockClear();
+
+    await expect(service.installFromUrl('http://plugins.example/svc-plg.zip')).rejects.toThrow(/#sha256=/);
+
+    // Nothing was downloaded and nothing was installed.
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(loader.getPlugin('svc-plg')).toBeUndefined();
+    expect(fs.existsSync(path.join(pluginsDir, 'svc-plg'))).toBe(false);
+  });
+
+  it('installs over plain http when the #sha256 pin matches the downloaded bytes', async () => {
+    const buf = pkg();
+    serveOnce(buf);
+
+    const dto = await service.installFromUrl(`http://plugins.example/svc-plg.zip#sha256=${sha256(buf)}`);
+
+    expect(dto.id).toBe('svc-plg');
+    expect(loader.getPlugin('svc-plg')).toBeDefined();
+  });
+
+  it('fails closed over plain http when the pinned digest does not match', async () => {
+    serveOnce(pkg());
+    const wrong = '0'.repeat(64);
+
+    await expect(service.installFromUrl(`http://plugins.example/svc-plg.zip#sha256=${wrong}`)).rejects.toThrow(
+      /integrity check failed/i,
+    );
+
+    expect(loader.getPlugin('svc-plg')).toBeUndefined();
+    expect(fs.existsSync(path.join(pluginsDir, 'svc-plg'))).toBe(false);
+  });
+
+  it('updateFromUrl applies the same transport rule: plain http without a pin is rejected before any fetch', async () => {
+    service.install({ buffer: pkg({ version: '1.0.0' }) });
+    fetchMock.mockClear();
+
+    await expect(service.updateFromUrl('svc-plg', 'http://plugins.example/svc-plg.zip')).rejects.toThrow(/#sha256=/);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(loader.getPlugin('svc-plg')?.manifest.version).toBe('1.0.0');
   });
 
   it('updateFromUrl fails closed on a mismatch and leaves the old version intact', async () => {
@@ -498,10 +575,6 @@ describe('PluginsService — per-session config', () => {
     expect(service.updateSessions('sess-cfg', []).activeSessions).toEqual([]);
   });
 
-  it('lets an unrestricted key activate for all sessions', () => {
-    expect(service.updateSessions('sess-cfg', ['*']).activeSessions).toEqual(['*']);
-  });
-
   it('clears the override when an empty slice is written', () => {
     service.updateSessionConfig('sess-cfg', 'sess-A', { lang: 'he' });
     service.updateSessionConfig('sess-cfg', 'sess-A', {});
@@ -642,6 +715,63 @@ describe('PluginsService — disable when the plugin is not loaded', () => {
   it('still throws NotFound for an id with no registry entry at all', async () => {
     const { service } = build();
     await expect(service.disable('never-installed')).rejects.toThrow(/not found/i);
+  });
+});
+
+describe('PluginsService: disable an engine plugin', () => {
+  let tmpDir: string;
+
+  afterEach(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+  const build = (status: PluginStatus, engineType: string) => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'owa-engine-'));
+    const settings: Record<string, string> = {
+      'plugins.dir': path.join(tmpDir, 'plugins'),
+      dataDir: tmpDir,
+      'engine.type': engineType,
+    };
+    const config = { get: (k: string) => settings[k] } as unknown as ConfigService;
+    const loader = new PluginLoaderService(
+      config,
+      new HookManager(),
+      new PluginStorageService(config),
+      {} as unknown as ModuleRef,
+    );
+    loader.registerBuiltInPlugin(
+      { id: 'baileys', name: 'Baileys', version: '1.0.0', type: PluginType.ENGINE, main: 'index.js' },
+      {},
+    );
+    loader.getPlugin('baileys')!.status = status;
+    return { loader, service: new PluginsService(loader, config) };
+  };
+
+  // The engine factory is pinned to engine.type and ignores plugin status, so a "disabled" engine kept
+  // serving and was re-enabled on the next boot while the API reported it disabled.
+  it.each([PluginStatus.ENABLED, PluginStatus.DISABLED])(
+    'refuses the active engine plugin in status %s and changes nothing',
+    async status => {
+      const { loader, service } = build(status, 'baileys');
+      const disablePlugin = jest.spyOn(loader, 'disablePlugin');
+      const setOperatorEnabled = jest.spyOn(loader, 'setOperatorEnabled');
+
+      const res = await service.disable('baileys');
+
+      expect(res.success).toBe(false);
+      expect(res.message).toMatch(/engine\.type/);
+      expect(disablePlugin).not.toHaveBeenCalled();
+      expect(setOperatorEnabled).not.toHaveBeenCalled();
+      expect(loader.getPlugin('baileys')!.status).toBe(status);
+    },
+  );
+
+  // An engine other than engine.type runs no sessions, so disabling it is an ordinary request.
+  it('answers a loaded engine that is not the active one the way it answers any idle plugin', async () => {
+    const { service } = build(PluginStatus.DISABLED, 'whatsapp-web.js');
+
+    await expect(service.disable('baileys')).resolves.toEqual({
+      success: true,
+      message: 'Plugin baileys is not enabled',
+    });
   });
 });
 
@@ -834,4 +964,36 @@ describe('PluginsService — recovering a plugin whose code went missing', () =>
 
     expect(fs.existsSync(path.join(pluginsDir, 'svc-plg', 'legacy.js'))).toBe(true);
   });
+});
+
+describe('PluginsService remote catalog', () => {
+  const fetchMock = fetchSafeBuffer as unknown as jest.Mock;
+  const service = (): PluginsService => {
+    const config = {
+      get: (k: string) => (k === 'plugins.catalogUrl' ? 'https://catalog.example/plugins.json' : undefined),
+    } as unknown as ConfigService;
+    return new PluginsService({ getAllPlugins: () => [] } as unknown as PluginLoaderService, config);
+  };
+  const serveOnce = (json: string): void => {
+    fetchMock.mockImplementationOnce(() => Promise.resolve(Buffer.from(json)));
+  };
+
+  it('annotates a well-formed catalog', async () => {
+    serveOnce('[{"id":"a","name":"A","version":"1.0.0"}]');
+    await expect(service().getCatalog()).resolves.toEqual([
+      { id: 'a', name: 'A', version: '1.0.0', installed: false, installedVersion: null, updateAvailable: false },
+    ]);
+  });
+
+  it.each(['[null]', '[{"id":"a","name":"A","version":"1.0.0"},5]', '[[]]'])(
+    'answers 400, not 500, for a catalog with a non-object entry (%s)',
+    async json => {
+      serveOnce(json);
+      const err: unknown = await service()
+        .getCatalog()
+        .catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(BadRequestException);
+      expect((err as BadRequestException).message).toMatch(/Invalid plugin catalog JSON/);
+    },
+  );
 });

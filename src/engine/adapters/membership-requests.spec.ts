@@ -1,4 +1,5 @@
 import { WwebjsGroups, normalizeWwebjsRequestMethod } from './wwebjs-groups';
+import { GroupNotFoundError } from '../../common/errors/group-not-found.error';
 import { BaileysGroups, type BaileysGroupsHost } from './baileys-groups';
 import { BaileysEvents, type BaileysEventsHost } from './baileys-events';
 import { EngineRefusedError } from '../../common/errors/engine-refused.error';
@@ -30,6 +31,7 @@ const logger = createLogger('membership-requests.spec');
 // ---------------------------------------------------------------------------------------------
 
 type WwebjsClientStub = {
+  getChatById: jest.Mock;
   getGroupMembershipRequests: jest.Mock;
   approveGroupMembershipRequests: jest.Mock;
   rejectGroupMembershipRequests: jest.Mock;
@@ -37,6 +39,9 @@ type WwebjsClientStub = {
 
 function makeWwebjsGroups(): { groups: WwebjsGroups; client: WwebjsClientStub } {
   const client: WwebjsClientStub = {
+    // The list resolves the group first, like every other group operation in this adapter, so the
+    // stub has to answer that lookup or the guard reads it as "no such group".
+    getChatById: jest.fn().mockResolvedValue({ isGroup: true }),
     getGroupMembershipRequests: jest.fn(),
     approveGroupMembershipRequests: jest.fn(),
     rejectGroupMembershipRequests: jest.fn(),
@@ -58,6 +63,16 @@ describe('WwebjsGroups membership requests', () => {
     expect(normalizeWwebjsRequestMethod('LinkedGroupJoin')).toBe('linked_group_join');
     expect(normalizeWwebjsRequestMethod('SomethingNew')).toBeUndefined();
     expect(normalizeWwebjsRequestMethod(undefined)).toBeUndefined();
+  });
+
+  // Every other group operation resolves the chat first; this list did not, so an unknown id or a
+  // non-group jid answered 200 with an empty array, which reads as "no pending requests" rather than
+  // "no such group". Baileys answers the refusal for the same call.
+  it('refuses an id that is not a group instead of answering an empty list', async () => {
+    const { groups, client } = makeWwebjsGroups();
+    client.getChatById.mockResolvedValue({ isGroup: false });
+    await expect(groups.getGroupMembershipRequests('628111@c.us')).rejects.toBeInstanceOf(GroupNotFoundError);
+    expect(client.getGroupMembershipRequests).not.toHaveBeenCalled();
   });
 
   it('lists membership requests, reading both wid spellings and dropping unreadable requesters', async () => {
@@ -121,6 +136,26 @@ describe('WwebjsGroups membership requests', () => {
       { id: '628111@c.us', success: true, message: 'done' },
       { id: '628222@c.us', success: false, status: 403, message: 'refused' },
     ]);
+  });
+
+  it.each([
+    ['approve', 'approveGroupMembershipRequests' as const],
+    ['reject', 'rejectGroupMembershipRequests' as const],
+  ])('%ss a bare phone number after qualifying it, like every other participant write', async (_action, method) => {
+    // GroupService.assertAddressableParticipants blesses a bare number, and the three other
+    // participant paths in this file qualify it before the engine sees it. Unqualified it reaches
+    // the page's `requesterIds.map(createWid)` (Injected/Utils.js:1540-1542), which upstream never
+    // does itself — Client.js appends '@c.us' before its own createWid calls — so the caller got an
+    // undiagnosable 500 on whatsapp-web.js for input that succeeds on Baileys.
+    const { groups, client } = makeWwebjsGroups();
+    client[method].mockResolvedValue([{ requesterId: '628123456789@c.us', message: 'done' }]);
+
+    await groups[method]('120363@g.us', ['628123456789', '628222@c.us']);
+
+    expect(client[method]).toHaveBeenCalledWith('120363@g.us', {
+      requesterIds: ['628123456789@c.us', '628222@c.us'],
+      sleep: [250, 500],
+    });
   });
 
   it('reports the code-less ServerStatusCodeError entry as a FAILURE, not a success', async () => {
@@ -190,16 +225,33 @@ function makeBaileysGroups(): { groups: BaileysGroups; sock: BaileysSockStub } {
   };
   const host: BaileysGroupsHost = {
     ensureReady: jest.fn(),
+    sessionProxyUrl: () => undefined,
     getSocket: () => sock as unknown as WASocket,
     logger,
     toNeutralJid: jid => jid.replace('@s.whatsapp.net', '@c.us'),
     toEngineJid: jid => jid.replace('@c.us', '@s.whatsapp.net'),
     normalizedSelfJid: () => '628999@c.us',
+    addLidMappings: jest.fn(),
   };
   return { groups: new BaileysGroups(host), sock };
 }
 
 describe('BaileysGroups membership requests', () => {
+  it.each([
+    ['listing', (g: BaileysGroups) => g.getGroupMembershipRequests('120363@g.us')],
+    ['acting on every pending request', (g: BaileysGroups) => g.approveGroupMembershipRequests('120363@g.us')],
+    [
+      'acting on named requesters',
+      (g: BaileysGroups) => g.rejectGroupMembershipRequests('120363@g.us', ['628111@c.us']),
+    ],
+  ])('answers GroupNotFoundError when WhatsApp reports the group gone (404) while %s', async (_n, call) => {
+    const { groups, sock } = makeBaileysGroups();
+    const gone = Object.assign(new Error('item-not-found'), { data: 404 });
+    sock.groupRequestParticipantsList.mockRejectedValue(gone);
+    sock.groupRequestParticipantsUpdate.mockRejectedValue(gone);
+    await expect(call(groups)).rejects.toBeInstanceOf(GroupNotFoundError);
+  });
+
   it('lists membership requests, neutralising jids and parsing the stringly wire attrs', async () => {
     const { groups, sock } = makeBaileysGroups();
     sock.groupRequestParticipantsList.mockResolvedValue([

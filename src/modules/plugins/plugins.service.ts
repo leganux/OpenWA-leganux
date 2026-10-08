@@ -2,13 +2,13 @@ import { Injectable, NotFoundException, BadRequestException, ConflictException, 
 import { ConfigService } from '@nestjs/config';
 import * as fs from 'fs';
 import * as path from 'path';
-import { PluginLoaderService, PluginStatus, resolvePluginMainPath } from '../../core/plugins';
+import { PluginLoaderService, PluginStatus, PluginType, resolvePluginEntryPath } from '../../core/plugins';
 import { pluginUpdateBackupDirName, pluginUpdateStagingDirName } from '../../core/plugins';
 import type { PluginConfigSchema } from '../../core/plugins';
 import { PluginDto } from './dto/plugin.dto';
 import { redactSecretConfig, restoreSecretConfig } from './redact-config';
 import { parsePluginPackage } from './plugin-installer';
-import { assertDownloadSha256, fetchSafeBuffer } from './plugin-download';
+import { assertDownloadSha256, assertPluginInstallUrl, fetchSafeBuffer } from './plugin-download';
 import { annotateCatalog, CatalogEntry, CatalogPlugin } from './catalog';
 import { redactSsrfError } from '../../common/security/ssrf-guard';
 import { createLogger } from '../../common/services/logger.service';
@@ -165,6 +165,21 @@ export class PluginsService {
       return { success: true, message: `Plugin ${id} is not loaded; it will not be enabled on boot` };
     }
 
+    if (
+      plugin.manifest.type === PluginType.ENGINE &&
+      id === (this.configService.get<string>('engine.type') ?? 'whatsapp-web.js')
+    ) {
+      // The engine factory is pinned to engine.type and never reads plugin status, and boot re-enables
+      // that engine regardless: "disabling" it here reported success while sessions kept starting on
+      // it. Refuse it in the same shape enable uses for a non-active engine. Kept at this layer, not in
+      // the lifecycle, because shutdown and unload must still tear engines down. An engine that is not
+      // engine.type runs nothing, so it takes the ordinary path below.
+      return {
+        success: false,
+        message: `Engine "${id}" cannot be disabled at runtime. Set engine.type and restart to switch engines.`,
+      };
+    }
+
     if (plugin.status !== PluginStatus.ENABLED) {
       // Clear the decision here too: a plugin sitting in ERROR after a failed restore is not ENABLED,
       // and disabling it must stop the gateway retrying it on every boot.
@@ -281,10 +296,12 @@ export class PluginsService {
     if (!entry || typeof entry !== 'string') {
       throw new NotFoundException(`Plugin ${id} has no config UI`);
     }
-    const base = path.resolve(this.pluginLoader.getPluginsDir(), id);
+    // Anchored to the package's own directory: the plugin is loaded by this point, and a package
+    // found in the legacy plugins directory does not live under the configured root.
+    const base = path.resolve(this.pluginLoader.getPluginPackageDir(id));
     let file: string;
     try {
-      file = resolvePluginMainPath(this.pluginLoader.getPluginsDir(), id, entry);
+      file = resolvePluginEntryPath(base, entry);
     } catch {
       throw new NotFoundException(`Config UI entry not found for plugin ${id}`);
     }
@@ -372,7 +389,7 @@ export class PluginsService {
   }
 
   /**
-   * Install a plugin from an HTTPS URL: download the .zip through the SSRF guard (host validated,
+   * Install a plugin from a URL: download the .zip through the SSRF guard (host validated,
    * connection pinned, redirects followed with every hop re-validated through the guard and the
    * chain capped at 5 hops, size-capped), then run the exact same validate-write-load
    * pipeline as an uploaded package. The downloaded buffer is treated as untrusted, identical to an
@@ -381,6 +398,26 @@ export class PluginsService {
    * means the package was substituted in transit and the install fails closed.
    */
   async installFromUrl(url: string): Promise<PluginDto> {
+    const buffer = await this.downloadPackage(url);
+    // Peek the id (the SSRF download stays outside the lock) so the install — which writes the plugin
+    // directory — is serialized against any concurrent uninstall/update of the same id.
+    const { manifest } = parsePluginPackage(buffer);
+    return this.serialize(manifest.id, () => Promise.resolve(this.install({ buffer })));
+  }
+
+  /**
+   * The single funnel every URL-sourced package download passes through (install + update):
+   * enforce the transport rule (https, or plain http carrying a `#sha256=` content pin) BEFORE any
+   * fetch, download through the SSRF-guarded path, then verify a pinned digest against the bytes.
+   * The remote catalog is deliberately NOT routed through here — its URL is operator configuration
+   * and its JSON is data, not executable code.
+   */
+  private async downloadPackage(url: string): Promise<Buffer> {
+    try {
+      assertPluginInstallUrl(url);
+    } catch (error) {
+      throw new BadRequestException(error instanceof Error ? error.message : String(error));
+    }
     const maxBytes = this.configService.get<number>('plugins.downloadMaxBytes') ?? 5 * 1024 * 1024;
     let buffer: Buffer;
     try {
@@ -397,10 +434,7 @@ export class PluginsService {
         `Plugin download integrity check failed: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
-    // Peek the id (the SSRF download stays outside the lock) so the install — which writes the plugin
-    // directory — is serialized against any concurrent uninstall/update of the same id.
-    const { manifest } = parsePluginPackage(buffer);
-    return this.serialize(manifest.id, () => Promise.resolve(this.install({ buffer })));
+    return buffer;
   }
 
   /**
@@ -424,6 +458,9 @@ export class PluginsService {
     try {
       const parsed: unknown = JSON.parse(raw.toString('utf8'));
       if (!Array.isArray(parsed)) throw new Error('catalog is not a JSON array');
+      if (!parsed.every(e => typeof e === 'object' && e !== null && !Array.isArray(e))) {
+        throw new Error('catalog entries must be JSON objects');
+      }
       entries = parsed as CatalogEntry[];
     } catch (error) {
       throw new BadRequestException(
@@ -468,11 +505,15 @@ export class PluginsService {
     }
 
     const wasEnabled = plugin.status === PluginStatus.ENABLED;
-    const pluginsDir = this.pluginLoader.getPluginsDir();
-    const dir = path.join(pluginsDir, id);
-    // Dot-prefixed siblings inside pluginsDir: same filesystem (so the renames stay EXDEV-safe) but
-    // skipped by the loader's directory scan, so a crash mid-update can't leave them loaded as a
-    // duplicate. The loader's boot-time recovery keys off these exact names.
+    // The tree the package was loaded from, which is the legacy plugins directory for a host that
+    // has not migrated. Updating in the configured root instead renames a directory that is not
+    // there, after unloadPlugin has already dropped the plugin from the runtime.
+    const dir = this.pluginLoader.getPluginPackageDir(id);
+    const pluginsDir = path.dirname(dir);
+    // Dot-prefixed siblings inside that same directory: same filesystem (so the renames stay
+    // EXDEV-safe) but skipped by the loader's directory scan, so a crash mid-update can't leave them
+    // loaded as a duplicate. The loader's boot-time recovery runs per scanned directory and keys off
+    // these exact names, so it reconciles the legacy tree too.
     const backup = path.join(pluginsDir, pluginUpdateBackupDirName(id));
     const staging = path.join(pluginsDir, pluginUpdateStagingDirName(id));
 
@@ -536,12 +577,20 @@ export class PluginsService {
     });
 
     try {
-      // ctx.storage files share the package directory under shipped defaults. Restore service-owned
-      // state from the backup unless the new package explicitly supplied that exact path. Copy (rather
-      // than move) so the rollback below still has a complete original directory.
+      // ctx.storage files share the package directory under shipped defaults. Restore state from the
+      // backup unless the new package explicitly supplied that exact path: encoded key-* files and the
+      // legacy <key>.json files the storage service still reads (every top-level *.json except the
+      // package's manifest.json/package.json). Copy (rather than move) so the rollback below still has
+      // a complete original directory.
       const packagePaths = new Set(entries.map(entry => entry.relPath));
       for (const entry of fs.readdirSync(backup, { withFileTypes: true })) {
-        if (!entry.isFile() || !/^key-[A-Za-z0-9_-]+\.json$/.test(entry.name) || packagePaths.has(entry.name)) {
+        if (
+          !entry.isFile() ||
+          !entry.name.endsWith('.json') ||
+          entry.name === 'manifest.json' ||
+          entry.name === 'package.json' ||
+          packagePaths.has(entry.name)
+        ) {
           continue;
         }
         const stateFile = path.join(dir, entry.name);
@@ -549,7 +598,14 @@ export class PluginsService {
         fs.chmodSync(stateFile, 0o600);
       }
       this.pluginLoader.loadPlugin(dir);
-      if (wasEnabled) {
+      if (wasEnabled && this.pluginLoader.isShuttingDown()) {
+        // Shutdown refuses new enables. That is not a failed update: keep the new version and let the
+        // next boot restore it from the persisted operator decision instead of rolling back.
+        logger.warn(`Plugin ${id} updated during shutdown; it will be enabled on the next start`, {
+          pluginId: id,
+          action: 'plugin_update_enable_deferred',
+        });
+      } else if (wasEnabled) {
         await this.pluginLoader.enablePlugin(id);
       }
       fs.rmSync(backup, { recursive: true, force: true });
@@ -590,22 +646,7 @@ export class PluginsService {
 
   /** Update an installed plugin by downloading the new package from a URL (SSRF-guarded), then in place. */
   async updateFromUrl(id: string, url: string): Promise<PluginDto> {
-    const maxBytes = this.configService.get<number>('plugins.downloadMaxBytes') ?? 5 * 1024 * 1024;
-    let buffer: Buffer;
-    try {
-      buffer = await fetchSafeBuffer(url, { maxBytes });
-    } catch (error) {
-      throw new BadRequestException(
-        `Failed to download plugin from URL: ${redactSsrfError(error, logger, 'plugin download')}`,
-      );
-    }
-    try {
-      assertDownloadSha256(url, buffer);
-    } catch (error) {
-      throw new BadRequestException(
-        `Plugin download integrity check failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
+    const buffer = await this.downloadPackage(url);
     return this.updatePackage(id, buffer);
   }
 

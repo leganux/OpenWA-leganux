@@ -12,9 +12,10 @@ import { type WwebjsEngineHost } from './wwebjs-host';
 
 /**
  * Message-domain client events (message, message_create, ack, revoke, reaction, edit) extracted
- * from the adapter's setupEventHandlers: pure mapping from wwebjs payloads to neutral events fired
+ * from the adapter's event wiring: pure mapping from wwebjs payloads to neutral events fired
  * through the engine callbacks. Connection-state events (qr/authenticated/ready/disconnected/
- * auth_failure) stay in the adapter — they drive the lifecycle latches this file never touches.
+ * auth_failure) stay in the lifecycle module (./wwebjs-lifecycle) — they drive the lifecycle
+ * latches this file never touches.
  */
 export function registerWwebjsMessageEvents(client: Client, host: WwebjsEngineHost): void {
   // eslint-disable-next-line @typescript-eslint/no-misused-promises
@@ -99,8 +100,9 @@ export function registerWwebjsMessageEvents(client: Client, host: WwebjsEngineHo
       const incomingMessage = buildIncomingMessageBase(msg);
       // Enrich with the media payload through the same capped path the incoming handler uses —
       // the base builder is sync and carries none, so a phone-sent image would otherwise persist
-      // and render as a bare 📎 marker even though the media is downloadable right here.
-      if (msg.hasMedia) {
+      // and render as a bare 📎 marker even though the media is downloadable right here. Not for an own
+      // status post: the echo consumer drops those, so the download would only hold a limiter slot.
+      if (msg.hasMedia && !incomingMessage.isStatusBroadcast) {
         try {
           incomingMessage.media = await host.capInboundMediaFor(msg);
         } catch (error) {
@@ -135,13 +137,15 @@ export function registerWwebjsMessageEvents(client: Client, host: WwebjsEngineHo
       return;
     }
     // Map the whatsapp-web.js MessageAck integer to the neutral DeliveryStatus here, at the
-    // adapter boundary, so no downstream consumer ever sees engine-specific ack codes.
-    host.getCallbacks().onMessageAck?.(ackId, wwebjsAckToDeliveryStatus(ack));
+    // adapter boundary, so no downstream consumer ever sees engine-specific ack codes. The chat is
+    // derived as Message._getChatId derives it (the same direction flag the revoked handler uses),
+    // so the ack's chatId matches the chatId of the message it belongs to.
+    const ackChatId = msg.fromMe ? msg.to : msg.from;
+    host.getCallbacks().onMessageAck?.(ackId, wwebjsAckToDeliveryStatus(ack), ackChatId || undefined);
   });
 
   client.on('message_revoke_everyone', (after, before) => {
     try {
-      const selfWid = host.getSelfWid();
       // Emit structured data only; the engine layer never produces a localized
       // display string. The dashboard renders the localized "message deleted" text.
       //
@@ -160,7 +164,9 @@ export function registerWwebjsMessageEvents(client: Client, host: WwebjsEngineHo
       const payload: RevokedMessage = {
         id: afterId?._serialized ?? afterId?.$1 ?? '',
         revokedId: beforeId?._serialized ?? beforeId?.$1,
-        chatId: after.from === selfWid ? after.to : after.from,
+        // Direction flag, as Message._getChatId: an own message in a LID chat carries the own LID as
+        // `from`, which never equals the phone-dialect account wid.
+        chatId: after.fromMe ? after.to : after.from,
         from: after.from,
         to: after.to,
         type: 'revoked',

@@ -1,4 +1,9 @@
-import { IngressEnqueueService, resolveIngressJobOptions, buildIngressDeadLetterRow } from './ingress-enqueue.service';
+import {
+  IngressEnqueueService,
+  resolveIngressJobOptions,
+  buildIngressDeadLetterRow,
+  sanitizeIngressJobId,
+} from './ingress-enqueue.service';
 import { PluginLoaderService } from '../../core/plugins/plugin-loader.service';
 import { ConfigService } from '@nestjs/config';
 
@@ -22,18 +27,147 @@ describe('IngressEnqueueService', () => {
     queue = { add: jest.fn().mockResolvedValue(undefined) };
   });
 
-  it('adds a job to the ingress queue with the given jobId when queueing is enabled and a queue is present', async () => {
+  it('adds a job to the ingress queue keyed by the namespaced jobId when queueing is enabled and a queue is present', async () => {
     (config.get as jest.Mock).mockReturnValue(true);
     const svc = new IngressEnqueueService(loader as PluginLoaderService, config as ConfigService, queue as never);
 
     expect(await svc.enqueue(data, 'd1')).toEqual({ outcome: 'queued' });
 
     expect(queue.add).toHaveBeenCalledWith('ingress', data, {
-      jobId: 'd1',
+      jobId: sanitizeIngressJobId('d1', 'chatwoot\u0000acct1'),
       attempts: 3,
       backoff: { type: 'exponential', delay: 5000 },
     });
     expect(loader.dispatchWebhookForInstance).not.toHaveBeenCalled();
+  });
+
+  describe('existingJobState', () => {
+    it('reads the state of the job under the same namespaced jobId enqueue() would use', async () => {
+      (config.get as jest.Mock).mockReturnValue(true);
+      const getJobState = jest.fn().mockResolvedValue('failed');
+      const svc = new IngressEnqueueService(
+        loader as PluginLoaderService,
+        config as ConfigService,
+        {
+          ...queue,
+          getJobState,
+        } as never,
+      );
+
+      expect(await svc.existingJobState(data, 'd1')).toBe('failed');
+      expect(getJobState).toHaveBeenCalledWith(sanitizeIngressJobId('d1', 'chatwoot\u0000acct1'));
+    });
+
+    it('reports no job when the queue holds none, is off, or cannot answer', async () => {
+      (config.get as jest.Mock).mockReturnValue(true);
+      const getJobState = jest.fn().mockResolvedValueOnce('unknown').mockRejectedValueOnce(new Error('ECONNREFUSED'));
+      const svc = new IngressEnqueueService(
+        loader as PluginLoaderService,
+        config as ConfigService,
+        {
+          ...queue,
+          getJobState,
+        } as never,
+      );
+      expect(await svc.existingJobState(data, 'd1')).toBeUndefined();
+      expect(await svc.existingJobState(data, 'd1')).toBeUndefined();
+
+      getJobState.mockClear();
+      (config.get as jest.Mock).mockReturnValue(false);
+      expect(await svc.existingJobState(data, 'd1')).toBeUndefined();
+      expect(getJobState).not.toHaveBeenCalled();
+    });
+
+    // IngressProcessor re-queues a delivery whose dead-letter write failed under a copy id: that copy
+    // owns the delivery while the original stays failed, or after removeOnFail pruned it.
+    it('reports a live or completed re-queued copy of a failed or pruned job', async () => {
+      (config.get as jest.Mock).mockReturnValue(true);
+      const base = sanitizeIngressJobId('d1', 'chatwoot\u0000acct1');
+      const states: Record<string, string> = { [base]: 'failed', [`${base}-requeued-2`]: 'delayed' };
+      const getJobState = jest.fn((id: string) => Promise.resolve(states[id] ?? 'unknown'));
+      const svc = new IngressEnqueueService(
+        loader as PluginLoaderService,
+        config as ConfigService,
+        { ...queue, getJobState } as never,
+      );
+
+      expect(await svc.existingJobState(data, 'd1')).toBe('delayed');
+      delete states[base];
+      expect(await svc.existingJobState(data, 'd1')).toBe('delayed');
+      states[`${base}-requeued-2`] = 'completed';
+      expect(await svc.existingJobState(data, 'd1')).toBe('completed');
+      states[`${base}-requeued-2`] = 'failed';
+      states[base] = 'failed';
+      expect(await svc.existingJobState(data, 'd1')).toBe('failed');
+      delete states[base];
+      expect(await svc.existingJobState(data, 'd1')).toBeUndefined();
+    });
+  });
+
+  // BullMQ refuses integer jobIds and colon ids that do not split into exactly 3 parts; before the
+  // sanitizer those throws read as "Redis unreachable" in the catch-all and silently degraded the
+  // delivery to inline dispatch (no retry, no backoff, blocked redrive loop).
+  describe('sanitizeIngressJobId', () => {
+    it('hashes ids BullMQ would accept too, so the namespace always applies', () => {
+      for (const id of ['d1', 'evt_abc-123', 'a:b:c', '0abc']) {
+        expect(sanitizeIngressJobId(id)).toMatch(/^ing-[0-9a-f]{40}$/);
+      }
+    });
+
+    it('namespaces a non-numeric id two instances share (one Svix message fanned out to both)', () => {
+      const a = sanitizeIngressJobId('msg_2LJx9', 'chatwoot\u0000acct-1');
+      const b = sanitizeIngressJobId('msg_2LJx9', 'chatwoot\u0000acct-2');
+      expect(a).not.toBe(b);
+      expect(sanitizeIngressJobId('msg_2LJx9', 'chatwoot\u0000acct-1')).toBe(a);
+    });
+
+    it('hashes the shapes BullMQ refuses, deterministically', () => {
+      const integer = sanitizeIngressJobId('12345');
+      const redrive = sanitizeIngressJobId('redrive:3f8e2a1b-9c4d-4e6f-8a2b-7d1c0e5f9a3b');
+      const twoPart = sanitizeIngressJobId('a:b');
+      const zeroLedThreePart = sanitizeIngressJobId('0:tenant:123'); // Queue.addJob: "cannot start with '0:'"
+      for (const hashed of [integer, redrive, twoPart, zeroLedThreePart]) {
+        expect(hashed).toMatch(/^ing-[0-9a-f]{40}$/);
+        expect(hashed).not.toContain(':');
+      }
+      expect(sanitizeIngressJobId('12345')).toBe(integer);
+      expect(sanitizeIngressJobId('redrive:3f8e2a1b-9c4d-4e6f-8a2b-7d1c0e5f9a3b')).toBe(redrive);
+      expect(sanitizeIngressJobId('0')).toMatch(/^ing-/); // Queue.addJob rejects the literal '0' too
+    });
+
+    it('coerces a non-string id (a duplicated header can surface as string[]) instead of throwing', () => {
+      const coerced = sanitizeIngressJobId(['0:tenant', '123'] as unknown as string);
+      expect(coerced).toMatch(/^ing-[0-9a-f]{40}$/);
+    });
+
+    it('namespaces the hash by plugin/instance so two instances sharing a numeric id do not collide', () => {
+      // BullMQ dedups jobIds across the whole shared queue while the DB dedup is
+      // (pluginId, instanceId, providerDeliveryId); numeric provider ids are per-account sequences.
+      const a = sanitizeIngressJobId('12345', 'chatwoot\u0000acct-1');
+      const b = sanitizeIngressJobId('12345', 'chatwoot\u0000acct-2');
+      expect(a).toMatch(/^ing-[0-9a-f]{40}$/);
+      expect(a).not.toBe(b);
+      expect(sanitizeIngressJobId('12345', 'chatwoot\u0000acct-1')).toBe(a); // stable for replays
+    });
+
+    it.each([
+      ['a numeric provider dedup header', '12345'],
+      ['the redrive replay id', 'redrive:3f8e2a1b-9c4d-4e6f-8a2b-7d1c0e5f9a3b'],
+      ['a two-part colon id', 'a:b'],
+      ['a zero-led three-part colon id', '0:tenant:123'],
+    ])('still queues (%s) instead of tripping the inline fallback', async (_label, jobId) => {
+      (config.get as jest.Mock).mockReturnValue(true);
+      const svc = new IngressEnqueueService(loader as PluginLoaderService, config as ConfigService, queue as never);
+
+      expect(await svc.enqueue(data, jobId)).toEqual({ outcome: 'queued' });
+
+      expect(queue.add).toHaveBeenCalledWith('ingress', data, {
+        jobId: sanitizeIngressJobId(jobId, `${data.pluginId}\u0000${data.instanceId}`),
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 5000 },
+      });
+      expect(loader.dispatchWebhookForInstance).not.toHaveBeenCalled();
+    });
   });
 
   it('dispatches inline when queueing is disabled, even if a queue instance is present', async () => {
@@ -108,7 +242,7 @@ describe('IngressEnqueueService', () => {
 
     expect(await svc.enqueue(data, 'd1')).toEqual({ outcome: 'dispatched' });
     expect(queue.add).toHaveBeenCalledWith('ingress', data, {
-      jobId: 'd1',
+      jobId: sanitizeIngressJobId('d1', 'chatwoot\u0000acct1'),
       attempts: 3,
       backoff: { type: 'exponential', delay: 5000 },
     });
@@ -132,6 +266,17 @@ describe('IngressEnqueueService', () => {
         else process.env.INGRESS_MAX_ATTEMPTS = prevA;
         if (prevD === undefined) delete process.env.INGRESS_RETRY_DELAY_MS;
         else process.env.INGRESS_RETRY_DELAY_MS = prevD;
+      }
+    });
+
+    it.each(['1e1', '0x10', '0'])('falls back to 3 attempts for INGRESS_MAX_ATTEMPTS=%p', raw => {
+      const prevA = process.env.INGRESS_MAX_ATTEMPTS;
+      try {
+        process.env.INGRESS_MAX_ATTEMPTS = raw;
+        expect(resolveIngressJobOptions().attempts).toBe(3);
+      } finally {
+        if (prevA === undefined) delete process.env.INGRESS_MAX_ATTEMPTS;
+        else process.env.INGRESS_MAX_ATTEMPTS = prevA;
       }
     });
 

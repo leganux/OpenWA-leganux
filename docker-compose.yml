@@ -93,7 +93,7 @@ services:
     pids_limit: ${OPENWA_PIDS_LIMIT:-2048}
     mem_limit: ${OPENWA_MEM_LIMIT:-2g} # tune up for many concurrent sessions
     ports:
-      - '127.0.0.1:${API_PORT:-2785}:2785'
+      - '${API_PORT:-7717}:2785'
     expose:
       - '2785'
     environment:
@@ -429,7 +429,6 @@ services:
   postgres:
     image: postgres:16-alpine
     container_name: openwa-postgres
-    profiles: ['postgres', 'full']
     restart: unless-stopped
     networks:
       - openwa-network
@@ -465,7 +464,6 @@ services:
   redis:
     image: redis:7-alpine
     container_name: openwa-redis
-    profiles: ['redis', 'full']
     restart: unless-stopped
     networks:
       - openwa-network
@@ -492,7 +490,6 @@ services:
   minio:
     image: pgsty/silo:RELEASE.2026-09-16T00-00-00Z@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46
     container_name: openwa-minio
-    profiles: ['minio', 'full']
     restart: unless-stopped
     networks:
       - openwa-network

@@ -451,6 +451,8 @@ services:
       # configured schema and sets the DB default search_path. No-op for 'public'; does not re-run
       # on an already-initialized volume (see the note in scripts/postgres-init-schema.sh).
       - ./scripts/postgres-init-schema.sh:/docker-entrypoint-initdb.d/01-create-schema.sh:ro
+    ports:
+      - '${POSTGRES_HOST_PORT:-7721}:5432'
     healthcheck:
       test: ['CMD-SHELL', 'pg_isready -U ${DATABASE_USERNAME:-openwa}']
       interval: 5s
@@ -509,8 +511,8 @@ services:
     volumes:
       - minio-data:/data
     ports:
-      - '127.0.0.1:9000:9000'
-      - '127.0.0.1:9001:9001'
+      - '${MINIO_API_PORT:-7719}:9000'
+      - '${MINIO_CONSOLE_PORT:-7720}:9001'
     healthcheck:
       test: ['CMD', 'curl', '-f', 'http://localhost:9000/minio/health/live']
       interval: 10s

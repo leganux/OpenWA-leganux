@@ -185,18 +185,14 @@ WORKDIR /app
 # Copy package files
 COPY package*.json ./
 
-# Backport upstream whatsapp-web.js#201832 (id._serialized -> id.$1 normalization,
-# broken by WA Web 2.3000.x ~2026-07-14) into the installed dep at build time.
-# The patcher self-disables once whatsapp-web.js ships the fix upstream.
 # scripts/postinstall.js rides along so a bare local `npm ci` keeps working, but the
 # --ignore-scripts install below skips the hook here: the explicit fatal run right
 # after is the sole (and stricter) applier for the image.
-COPY scripts/postinstall.js scripts/patch-wwebjs-201832.js scripts/wwebjs-201832.patch scripts/patch-wwebjs-newsletter-preview.js scripts/patch-wwebjs-status.js scripts/patch-wwebjs-ready-sync.js scripts/patch-wwebjs-participant-arity.js scripts/patch-wwebjs-block.js scripts/patch-wwebjs-group-description.js scripts/patch-wwebjs-media-id.js scripts/patch-wwebjs-send-error.js scripts/patch-wwebjs-download-mimetype.js scripts/patch-baileys-appstate.js scripts/patch-baileys-newsletter-create.js scripts/patch-baileys-pairing.js ./scripts/
+COPY scripts/postinstall.js scripts/atomic-write.js scripts/patch-wwebjs-newsletter-preview.js scripts/patch-wwebjs-status.js scripts/patch-wwebjs-ready-sync.js scripts/patch-wwebjs-participant-arity.js scripts/patch-wwebjs-media-id.js scripts/patch-wwebjs-send-error.js scripts/patch-wwebjs-puppeteer.js scripts/patch-baileys-appstate.js scripts/patch-baileys-newsletter-create.js scripts/patch-baileys-pairing.js scripts/patch-baileys-media-stream.js scripts/patch-baileys-media-signal.js scripts/patch-baileys-status-ack.js scripts/patch-baileys-event-buffer.js ./scripts/
 
-# Install production dependencies only, then apply the backports. The status patcher runs after
-# the two patchers it depends on: its transforms were written against the tree they leave behind.
-# The send-error patcher runs after the other two that edit Client.js, so theirs still meet the
-# tree they were written against.
+# Install production dependencies only, then apply the backports. Each patcher matches the pristine
+# library on its own and none depends on another's edits, so the order below is not load-bearing:
+# applied in reverse, they leave the same tree.
 # scripts/dockerfile-patchers.spec.js derives this list from scripts/patch-*.js and fails if a
 # patcher is added without being copied AND run here — a hand-written list loses one silently, and
 # the Baileys one shipped in postinstall for a whole release without ever reaching the image.
@@ -210,19 +206,20 @@ COPY scripts/postinstall.js scripts/patch-wwebjs-201832.js scripts/wwebjs-201832
 # need to run are the explicit fatal invocations below; baileys' preinstall is only
 # a node-version check that the engines field enforces anyway.
 RUN npm ci --omit=dev --ignore-scripts \
-    && node scripts/patch-wwebjs-201832.js \
     && node scripts/patch-wwebjs-newsletter-preview.js \
     && node scripts/patch-wwebjs-status.js \
     && node scripts/patch-wwebjs-ready-sync.js \
     && node scripts/patch-wwebjs-participant-arity.js \
-    && node scripts/patch-wwebjs-block.js \
-    && node scripts/patch-wwebjs-group-description.js \
     && node scripts/patch-wwebjs-media-id.js \
     && node scripts/patch-wwebjs-send-error.js \
-    && node scripts/patch-wwebjs-download-mimetype.js \
     && node scripts/patch-baileys-appstate.js \
     && node scripts/patch-baileys-newsletter-create.js \
     && node scripts/patch-baileys-pairing.js \
+    && node scripts/patch-baileys-media-stream.js \
+    && node scripts/patch-baileys-media-signal.js \
+    && node scripts/patch-baileys-status-ack.js \
+    && node scripts/patch-baileys-event-buffer.js \
+    && node scripts/patch-wwebjs-puppeteer.js \
     && npm cache clean --force
 
 # Replace the npm the base image bundles. npm is not on the request path — the entrypoint runs

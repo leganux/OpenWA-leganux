@@ -1,3 +1,8 @@
+import { ConfigModule, ConfigService } from '@nestjs/config';
+import { Test } from '@nestjs/testing';
+import configuration from '../../config/configuration';
+import { LoggerModule } from './logger.module';
+import { SHUTDOWN_TEARDOWN_LIMIT_MS } from './shutdown-budget';
 import { ShutdownService } from './shutdown.service';
 
 /**
@@ -16,6 +21,29 @@ describe('ShutdownService (draining flag)', () => {
     expect(svc.isShuttingDown()).toBe(true);
     svc.markShuttingDown(); // no throw, stays true
     expect(svc.isShuttingDown()).toBe(true);
+  });
+
+  it('isolates a throwing onShutdown listener so remaining listeners still run', () => {
+    const svc = new ShutdownService();
+    const warn = jest.spyOn(svc['logger'], 'warn').mockImplementation(() => undefined);
+    const second = jest.fn();
+    const third = jest.fn();
+
+    svc.onShutdown(() => {
+      throw new Error('listener boom');
+    });
+    svc.onShutdown(second);
+    svc.onShutdown(third);
+
+    expect(() => svc.markShuttingDown()).not.toThrow();
+    expect(svc.isShuttingDown()).toBe(true);
+    expect(second).toHaveBeenCalledTimes(1);
+    expect(third).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('listener'),
+      expect.objectContaining({ error: 'listener boom' }),
+    );
+    warn.mockRestore();
   });
 });
 
@@ -124,6 +152,18 @@ describe('ShutdownService.shutdown (idempotent, bounded grace)', () => {
     await jest.advanceTimersByTimeAsync(2000);
     expect(cb).toHaveBeenCalledTimes(1);
   });
+
+  // The grace counts 1:1 against the kill deadline (shutdown-budget.ts), so a setting past the cap would
+  // push every stop beyond the stop grace period the packaged runtimes ship.
+  it('caps SHUTDOWN_DELAY_MS at 30 s, however large the setting', async () => {
+    process.env.SHUTDOWN_DELAY_MS = '99999';
+    const { svc, cb } = svcWithCb();
+    svc.shutdown();
+    await jest.advanceTimersByTimeAsync(29_999);
+    expect(cb).not.toHaveBeenCalled();
+    await jest.advanceTimersByTimeAsync(1);
+    expect(cb).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('ShutdownService exit status (teardown outcome)', () => {
@@ -171,5 +211,145 @@ describe('ShutdownService exit status (teardown outcome)', () => {
     await jest.advanceTimersByTimeAsync(0);
     expect(exitSpy).toHaveBeenCalledTimes(1);
     expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+});
+
+describe('ShutdownService force-exit backstop', () => {
+  let exitSpy: jest.SpyInstance;
+
+  beforeEach(() => {
+    jest.useFakeTimers();
+    exitSpy = jest.spyOn(process, 'exit').mockImplementation((): never => undefined as never);
+  });
+
+  afterEach(() => {
+    jest.clearAllTimers();
+    jest.useRealTimers();
+    exitSpy.mockRestore();
+    delete process.env.SHUTDOWN_DELAY_MS;
+  });
+
+  const hung = (delay: string, webhookDrainMs?: number): ShutdownService => {
+    process.env.SHUTDOWN_DELAY_MS = delay;
+    const config = { get: () => webhookDrainMs } as unknown as ConfigService;
+    const svc = new ShutdownService(webhookDrainMs === undefined ? undefined : config);
+    svc.setShutdownCallback(() => new Promise<void>(() => undefined));
+    jest.spyOn(svc['logger'], 'error').mockImplementation(() => undefined);
+    return svc;
+  };
+
+  it('exits 1 exactly at SHUTDOWN_TEARDOWN_LIMIT_MS after the grace when teardown never finishes', async () => {
+    hung('0').shutdown();
+    await jest.advanceTimersByTimeAsync(SHUTDOWN_TEARDOWN_LIMIT_MS - 1);
+    expect(exitSpy).not.toHaveBeenCalled();
+    await jest.advanceTimersByTimeAsync(1);
+    expect(exitSpy).toHaveBeenCalledTimes(1);
+    expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  it('measures the limit from the end of the grace, so a raised SHUTDOWN_DELAY_MS moves the exit with it', async () => {
+    hung('20000').shutdown();
+    await jest.advanceTimersByTimeAsync(20_000 + SHUTDOWN_TEARDOWN_LIMIT_MS - 1);
+    expect(exitSpy).not.toHaveBeenCalled();
+    await jest.advanceTimersByTimeAsync(1);
+    expect(exitSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('adds the excess of WEBHOOK_SHUTDOWN_DRAIN_MS over its 5 s default to the limit', async () => {
+    hung('0', 15_000).shutdown();
+    await jest.advanceTimersByTimeAsync(SHUTDOWN_TEARDOWN_LIMIT_MS + 10_000 - 1);
+    expect(exitSpy).not.toHaveBeenCalled();
+    await jest.advanceTimersByTimeAsync(1);
+    expect(exitSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('lowers the limit for a drain shorter than the default', async () => {
+    hung('0', 0).shutdown();
+    await jest.advanceTimersByTimeAsync(SHUTDOWN_TEARDOWN_LIMIT_MS - 5_000);
+    expect(exitSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the timer inside what Node accepts for an enormous drain', async () => {
+    hung('0', Number.MAX_SAFE_INTEGER).shutdown();
+    await jest.advanceTimersByTimeAsync(0);
+    expect(exitSpy).not.toHaveBeenCalled();
+    await jest.advanceTimersByTimeAsync(2 ** 31 - 2);
+    expect(exitSpy).not.toHaveBeenCalled();
+    await jest.advanceTimersByTimeAsync(1);
+    expect(exitSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('is cleared when teardown completes, so no second exit follows', async () => {
+    process.env.SHUTDOWN_DELAY_MS = '0';
+    const svc = new ShutdownService();
+    svc.setShutdownCallback(jest.fn().mockResolvedValue(undefined));
+    svc.shutdown();
+    await jest.advanceTimersByTimeAsync(0);
+    expect(exitSpy).toHaveBeenCalledTimes(1);
+    expect(exitSpy).toHaveBeenCalledWith(0);
+    await jest.advanceTimersByTimeAsync(SHUTDOWN_TEARDOWN_LIMIT_MS);
+    expect(exitSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('is cleared when teardown fails, leaving the single exit(1) of the failure', async () => {
+    process.env.SHUTDOWN_DELAY_MS = '0';
+    const svc = new ShutdownService();
+    svc.setShutdownCallback(jest.fn().mockRejectedValue(new Error('boom')));
+    jest.spyOn(svc['logger'], 'error').mockImplementation(() => undefined);
+    svc.shutdown();
+    await jest.advanceTimersByTimeAsync(SHUTDOWN_TEARDOWN_LIMIT_MS);
+    expect(exitSpy).toHaveBeenCalledTimes(1);
+    expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  // Fake timers make unref a no-op, so the handle of the budget timer is watched directly.
+  it('keeps the timer referenced, so a teardown parked on a handle-less promise cannot exit 0', async () => {
+    const real = global.setTimeout;
+    const unrefs: jest.SpyInstance[] = [];
+    const spy = jest.spyOn(global, 'setTimeout').mockImplementation((fn: () => void, ms?: number) => {
+      const handle = real(fn, ms);
+      if (ms === SHUTDOWN_TEARDOWN_LIMIT_MS) unrefs.push(jest.spyOn(handle, 'unref'));
+      return handle;
+    });
+    try {
+      hung('0').shutdown();
+      await jest.advanceTimersByTimeAsync(0);
+      expect(unrefs).toHaveLength(1);
+      expect(unrefs[0]).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('arms one timer however often shutdown is requested', async () => {
+    const svc = hung('0');
+    svc.shutdown();
+    svc.shutdown();
+    await jest.advanceTimersByTimeAsync(0);
+    expect(jest.getTimerCount()).toBe(1);
+    await jest.advanceTimersByTimeAsync(SHUTDOWN_TEARDOWN_LIMIT_MS);
+    expect(exitSpy).toHaveBeenCalledTimes(1);
+  });
+
+  // The constructor parameter is @Optional(), so a wiring break would silently fall back to the default
+  // drain and the force-exit would stop following WEBHOOK_SHUTDOWN_DRAIN_MS.
+  it('receives the real ConfigService, so the exit follows WEBHOOK_SHUTDOWN_DRAIN_MS', async () => {
+    process.env.WEBHOOK_SHUTDOWN_DRAIN_MS = '12000';
+    process.env.SHUTDOWN_DELAY_MS = '0';
+    try {
+      const moduleRef = await Test.createTestingModule({
+        imports: [ConfigModule.forRoot({ isGlobal: true, ignoreEnvFile: true, load: [configuration] }), LoggerModule],
+      }).compile();
+      const svc = moduleRef.get(ShutdownService);
+      svc.setShutdownCallback(() => new Promise<void>(() => undefined));
+      jest.spyOn(svc['logger'], 'error').mockImplementation(() => undefined);
+      svc.shutdown();
+      await jest.advanceTimersByTimeAsync(SHUTDOWN_TEARDOWN_LIMIT_MS + 7_000 - 1);
+      expect(exitSpy).not.toHaveBeenCalled();
+      await jest.advanceTimersByTimeAsync(1);
+      expect(exitSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      delete process.env.WEBHOOK_SHUTDOWN_DRAIN_MS;
+    }
   });
 });

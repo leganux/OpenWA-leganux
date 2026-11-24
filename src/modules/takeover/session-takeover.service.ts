@@ -6,7 +6,7 @@ import { Session, SessionStatus } from '../session/entities/session.entity';
 import { SessionOwnershipService } from '../session/session-ownership.service';
 import { ShutdownService } from '../../common/services/shutdown.service';
 import { SessionService } from '../session/session.service';
-import { SessionStoppedException } from '../session/session-engine-controls';
+import { ServerShuttingDownException, SessionStoppedException } from '../session/session-engine-controls';
 import { resolveMaxConcurrentSessions } from '../session/session-engine-lifecycle.service';
 
 /**
@@ -141,16 +141,26 @@ export class SessionTakeoverService implements OnApplicationBootstrap, OnModuleD
     // INITIALIZING written by start() afterwards, so the correction can never land on a live engine.
     // Idempotent, because DISCONNECTED is not one of the statuses it acts on. A failure leaves no
     // write pending, so the adopt loop still runs; the next pass retries the correction.
-    const goneBefore = new Date(Date.now() - this.ownership.leaseTtlMs * STRANDED_LEASE_TTL_MULTIPLE);
+    const strandedGraceMs = this.ownership.leaseTtlMs * STRANDED_LEASE_TTL_MULTIPLE;
+    const goneBefore = new Date(Date.now() - strandedGraceMs);
+    let corrected: string[] = [];
     try {
-      await this.sessionService.markLapsedDisconnected(lapsed, goneBefore);
+      corrected = await this.sessionService.markLapsedDisconnected(lapsed, goneBefore, strandedGraceMs);
     } catch (error) {
       this.logger.warn('Lapsed session status correction failed', {
         error: error instanceof Error ? error.message : String(error),
       });
     }
 
-    if (!resolveFeatureFlags(this.configService).autoStartSessions) return;
+    if (!resolveFeatureFlags(this.configService).autoStartSessions) {
+      // A linked session corrected here was not down yet when the boot counted, so the hint is given now:
+      // only for one auto-start would have launched, and without waiting, so a slow count holds no sweep.
+      const wentDown = lapsed.some(
+        session => corrected.includes(session.id) && Boolean(session.phone) && !session.desiredState,
+      );
+      if (wentDown) void this.sessionService.noteSessionsLeftDown();
+      return;
+    }
     const eligible = lapsed.filter(session => this.isEligible(session));
     if (eligible.length === 0) return;
 
@@ -179,6 +189,10 @@ export class SessionTakeoverService implements OnApplicationBootstrap, OnModuleD
         if (error instanceof SessionStoppedException) {
           // Stopped between the sweep's read and this start; the start refused it, as it should.
           this.logger.debug(`Session ${session.name} skipped: stopped by an operator`, { sessionId: session.id });
+        } else if (error instanceof ServerShuttingDownException) {
+          // Shutdown began while this start was in flight; the session is left for a peer or the next boot.
+          this.logger.debug(`Takeover of session ${session.name} abandoned: shutting down`, { sessionId: session.id });
+          return;
         } else if (error instanceof ConflictException) {
           // A peer won the race — exactly the claim doing its job.
           this.logger.debug(`Session ${session.name} was adopted by another node first`, { sessionId: session.id });
@@ -204,7 +218,8 @@ export class SessionTakeoverService implements OnApplicationBootstrap, OnModuleD
   private isEligible(session: Session): boolean {
     // Only authenticated sessions (phone set): an engine is worth relaunching exactly when the
     // saved credentials can restore the link without a human scanning anything. A session an
-    // operator stopped stays down until an explicit start, wherever its claim lapsed.
-    return Boolean(session.phone) && TAKEOVER_STATUSES.has(session.status) && session.desiredState !== 'stopped';
+    // operator stopped, or whose delete failed part-way, stays down until an explicit start, wherever
+    // its claim lapsed.
+    return Boolean(session.phone) && TAKEOVER_STATUSES.has(session.status) && !session.desiredState;
   }
 }

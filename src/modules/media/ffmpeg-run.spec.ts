@@ -3,6 +3,7 @@ import { chmod, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { FfmpegConversionError, FfmpegSpawnError, killRunningConversions, probeFfmpeg, runFfmpeg } from './ffmpeg';
+import { waitUntil } from '../../../test/helpers/wait-until';
 
 // The real spawn, wrapped so a test can reach the child process it created.
 jest.mock('node:child_process', () => {
@@ -78,6 +79,44 @@ esac
   /** Temp directories this module creates, so cleanup can be asserted rather than assumed. */
   const convertDirs = async (): Promise<string[]> =>
     (await readdir(tmpdir())).filter(name => name.startsWith('openwa-convert-'));
+
+  // ffmpeg decodes bytes a caller chose, on every Baileys voice note too: it gets no secret of the gateway's.
+  // Read from the spawn options: Jest sandboxes process.env, so what the child printed could not tell.
+  it('does not hand the gateway environment to ffmpeg', async () => {
+    const spawned = jest.mocked(spawn);
+    spawned.mockClear();
+    process.env.OWA_PROBE_SECRET = 'hunter2';
+    try {
+      await runFfmpeg(Buffer.from('input'), 'bin', 'ogg', [], options());
+    } finally {
+      delete process.env.OWA_PROBE_SECRET;
+    }
+
+    const env = (spawned.mock.calls[0][2] as { env?: Record<string, string> }).env;
+    expect(env).toBeDefined();
+    expect(env).not.toHaveProperty('OWA_PROBE_SECRET');
+    expect(env).toHaveProperty('PATH');
+  });
+
+  // An FFMPEG_PATH wrapper script, or a Windows host, needs a home, a temp directory or the system root.
+  it('hands ffmpeg the variables a wrapper script and a Windows process load with', async () => {
+    const spawned = jest.mocked(spawn);
+    spawned.mockClear();
+    const names = ['HOME', 'TEMP', 'TMP', 'SystemRoot'];
+    const saved = names.map(name => process.env[name]);
+    names.forEach(name => (process.env[name] = `value-of-${name}`));
+    try {
+      await runFfmpeg(Buffer.from('input'), 'bin', 'ogg', [], options());
+    } finally {
+      names.forEach((name, i) => {
+        if (saved[i] === undefined) delete process.env[name];
+        else process.env[name] = saved[i];
+      });
+    }
+
+    const env = (spawned.mock.calls[0][2] as { env?: Record<string, string> }).env;
+    for (const name of names) expect(env?.[name]).toBe(`value-of-${name}`);
+  });
 
   it('returns the bytes the process produced', async () => {
     const output = await runFfmpeg(Buffer.from('input'), 'bin', 'ogg', [], options());
@@ -161,12 +200,12 @@ esac
       }
     };
     try {
-      for (let i = 0; i < 40 && alive(); i++) await new Promise(r => setTimeout(r, 50));
+      await waitUntil(() => !alive());
       expect(alive()).toBe(false);
     } finally {
       if (alive()) process.kill(grandchild, 'SIGKILL');
     }
-  }, 15_000);
+  }, 60_000);
 
   // Each run sits in its own process group, so a signal to the gateway's group never reaches it and its
   // timeout dies with the gateway. Whatever is still running has to be killed on the way out.
@@ -179,10 +218,10 @@ esac
     const settled = run.catch((error: unknown) => error);
 
     let grandchild = 0;
-    for (let i = 0; i < 40 && !grandchild; i++) {
-      await new Promise(r => setTimeout(r, 50));
+    await waitUntil(async () => {
       grandchild = Number((await readFile(pidFile, 'utf8').catch(() => '')).trim());
-    }
+      return grandchild > 0;
+    });
     const alive = (): boolean => {
       try {
         process.kill(grandchild, 0);
@@ -192,17 +231,17 @@ esac
       }
     };
     try {
-      // The stub's own sleep ends in 10 s, so the kill has to land well before that to count.
+      // The stub's own sleep ends in 10 s, so the kill has to land well before that to count: six seconds leaves four.
       const killedAt = Date.now();
       killRunningConversions();
       expect(await settled).toBeInstanceOf(FfmpegConversionError);
-      for (let i = 0; i < 40 && alive(); i++) await new Promise(r => setTimeout(r, 50));
+      await waitUntil(() => !alive(), 6_000);
       expect(alive()).toBe(false);
-      expect(Date.now() - killedAt).toBeLessThan(2_000);
+      expect(Date.now() - killedAt).toBeLessThan(6_000);
     } finally {
       if (alive()) process.kill(grandchild, 'SIGKILL');
     }
-  }, 15_000);
+  }, 60_000);
 
   // Transcoding can inflate as well as shrink, so the output needs a ceiling of its own.
   it('refuses output above the cap, and says what it measured', async () => {

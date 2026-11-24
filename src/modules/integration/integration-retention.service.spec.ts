@@ -4,6 +4,7 @@ import { IntegrationDeliveryFailure } from './entities/integration-delivery-fail
 import { IntegrationRetentionService } from './integration-retention.service';
 import { IngressReconcilerService } from './ingress-reconciler.service';
 import { IngressEnqueueService } from './ingress-enqueue.service';
+import { INGRESS_SHUTDOWN_WAIT_MS } from './integration.constants';
 import { PluginInstanceService } from './plugin-instance.service';
 import { PluginLoaderService } from '../../core/plugins/plugin-loader.service';
 import { Session } from '../session/entities/session.entity';
@@ -178,14 +179,26 @@ describe('IntegrationRetentionService.onModuleInit (retention scheduling)', () =
   const original = process.env.INGRESS_RETENTION_DAYS;
   const originalDedup = process.env.INGRESS_DEDUP_RETENTION_DAYS;
 
+  // Repositories the batched prune can drive: the dialect it asks for, and one expired event to find and delete.
   const mockRepos = () => {
-    const eventsDelete = jest.fn().mockResolvedValue({ affected: 0 });
+    const manager = { connection: { options: { type: 'better-sqlite3' } } };
+    const eventsDelete = jest.fn().mockResolvedValue({ affected: 1 });
     const failuresDelete = jest.fn().mockResolvedValue({ affected: 0 });
+    const failuresFind = jest.fn().mockResolvedValue([]);
     return {
       eventsDelete,
       failuresDelete,
-      events: { delete: eventsDelete } as unknown as Repository<IngressEvent>,
-      failures: { delete: failuresDelete } as unknown as Repository<IntegrationDeliveryFailure>,
+      failuresFind,
+      events: {
+        manager,
+        find: jest.fn().mockResolvedValue([{ id: 'expired' }]),
+        delete: eventsDelete,
+      } as unknown as Repository<IngressEvent>,
+      failures: {
+        manager,
+        find: failuresFind,
+        delete: failuresDelete,
+      } as unknown as Repository<IntegrationDeliveryFailure>,
       reconciler: { deadLetterAgedPending: jest.fn().mockResolvedValue(0) } as unknown as IngressReconcilerService,
     };
   };
@@ -207,7 +220,8 @@ describe('IntegrationRetentionService.onModuleInit (retention scheduling)', () =
     // Let the startup prune promise settle (the method runs before the log .then()).
     await new Promise(resolve => setImmediate(resolve));
     // Dedup rows are never an audit log — their prune cannot be disabled to infinity.
-    expect(repos.eventsDelete).toHaveBeenCalled();
+    expect(repos.eventsDelete).toHaveBeenCalledWith(['expired']);
+    expect(repos.failuresFind).not.toHaveBeenCalled();
     expect(repos.failuresDelete).not.toHaveBeenCalled();
     svc.onModuleDestroy();
   });
@@ -273,6 +287,7 @@ describe('IntegrationRetentionService.pruneOlderThan with undispatched events', 
   let resolveInstance: jest.Mock;
   let existingJobState: jest.Mock;
   let logError: jest.SpyInstance;
+  let logWarn: jest.SpyInstance;
   const SESSION_ID = '11111111-1111-4111-8111-111111111111';
 
   beforeEach(async () => {
@@ -298,7 +313,7 @@ describe('IntegrationRetentionService.pruneOlderThan with undispatched events', 
       { resolve: resolveInstance } as unknown as PluginInstanceService,
     );
     service = new IntegrationRetentionService(events, failures, reconciler);
-    jest.spyOn(LoggerService.prototype, 'warn').mockImplementation(() => undefined);
+    logWarn = jest.spyOn(LoggerService.prototype, 'warn').mockImplementation(() => undefined);
     logError = jest.spyOn(LoggerService.prototype, 'error').mockImplementation(() => undefined);
   });
 
@@ -351,6 +366,42 @@ describe('IntegrationRetentionService.pruneOlderThan with undispatched events', 
       method: 'POST',
       ingress: { body: '{"msg":"hello"}', rawBody: '{"msg":"hello"}' },
     });
+  });
+
+  // Past the dedup window a row is not held back for a queue that cannot be asked: it gets its dead letter, with
+  // the payload kept there, as a row with no job does. (The sweep, by contrast, replays nothing while the queue
+  // cannot be asked, since the job may be alive.)
+  it('dead-letters an aged pending event whose queue cannot be asked, like one with no job', async () => {
+    await insertEvent('stranded', {});
+    existingJobState.mockResolvedValue('unreachable');
+
+    await service.pruneOlderThan(7, 90);
+
+    expect(await events.findOneByOrFail({ id: 'stranded' })).toMatchObject({ dispatchState: 'failed', payload: null });
+    const [dlq] = await failures.find();
+    expect(dlq).toMatchObject({ deliveryId: 'd-stranded', redriven: false });
+    expect(dlq.payload).toMatchObject({ route: 'chatwoot', ingress: { rawBody: '{"msg":"hello"}' } });
+  });
+
+  it('hands off the healthy rows behind one whose stored payload is not JSON', async () => {
+    // Only an imported or hand-edited row can hold such text. Read with the batch it failed the whole
+    // read, so nothing behind it was ever dead-lettered and every run failed the same way.
+    await insertEvent('unreadable', { createdAt: daysAgo(10) });
+    await insertEvent('healthy-1', {});
+    await insertEvent('healthy-2', {});
+    await ds.query(`UPDATE ingress_events SET payload = '{oops' WHERE id = 'unreadable'`);
+
+    expect(await service.pruneOlderThan(7, 90)).toEqual({ events: 0, failures: 0 });
+
+    expect(await events.findOneByOrFail({ id: 'healthy-1' })).toMatchObject({ dispatchState: 'failed', payload: null });
+    expect(await events.findOneByOrFail({ id: 'healthy-2' })).toMatchObject({ dispatchState: 'failed', payload: null });
+    expect((await failures.find()).map(row => row.deliveryId).sort()).toEqual(['d-healthy-1', 'd-healthy-2']);
+    // Kept for an operator to remove: neither settled nor deleted, and the next run still moves on.
+    expect(await ds.query(`SELECT "dispatchState", payload FROM ingress_events WHERE id = 'unreadable'`)).toEqual([
+      { dispatchState: 'pending', payload: '{oops' },
+    ]);
+    expect(await service.pruneOlderThan(7, 90)).toEqual({ events: 2, failures: 0 });
+    expect(await events.count()).toBe(1);
   });
 
   it('retires the payload without a second dead letter when the live path already wrote one', async () => {
@@ -496,7 +547,7 @@ describe('IntegrationRetentionService.pruneOlderThan with undispatched events', 
 
       await service.pruneOlderThan(7, 90);
 
-      // The other node retires its own row once its check sees this one; this node's row stays.
+      // The other writer, a hand-off or a sweep, retires its own row once its check sees this one.
       const open = await openIds();
       expect(open).toHaveLength(2);
       expect(open).toContain(HIGH_ID);
@@ -593,12 +644,64 @@ describe('IntegrationRetentionService.pruneOlderThan with undispatched events', 
 
   it('still prunes aged events when the dead-letter prune fails', async () => {
     await insertEvent('dispatched', { dispatchState: 'dispatched', payload: null });
+    await insertAgedFailure();
     jest.spyOn(failures, 'delete').mockRejectedValueOnce(new Error('locked'));
 
     const result = await service.pruneOlderThan(7, 90);
 
     expect(result).toEqual({ events: 1, failures: 0 });
     expect(await events.count()).toBe(0);
+    expect(await failures.count()).toBe(1);
+  });
+
+  // A dead letter older than the 90-day window, so the first step of a run has something to remove.
+  const insertAgedFailure = () =>
+    failures
+      .createQueryBuilder()
+      .insert()
+      .values({
+        direction: 'inbound',
+        pluginId: 'plug',
+        instanceId: 'inst',
+        attempts: 1,
+        lastError: 'old',
+        redriven: false,
+        createdAt: daysAgo(100),
+      })
+      .execute();
+
+  it('still hands off an aged pending event when the dedup delete fails', async () => {
+    await insertEvent('stranded', {});
+    await insertEvent('dispatched', { dispatchState: 'dispatched', payload: null });
+    await insertAgedFailure();
+    jest.spyOn(events, 'delete').mockRejectedValueOnce(new Error('locked'));
+
+    const result = await service.pruneOlderThan(7, 90);
+
+    // The failed delete counts as nothing removed, the dead-letter prune before it still counts, and the
+    // hand-off after it still ran: a locked table must not hold the day's hand-off back another 24 hours.
+    expect(result).toEqual({ events: 0, failures: 1 });
+    expect(await events.findOneByOrFail({ id: 'stranded' })).toMatchObject({ dispatchState: 'failed', payload: null });
+    expect(await failures.count()).toBe(1);
+    expect(logError).toHaveBeenCalledWith(
+      'Integration ingress retention: dedup prune failed',
+      expect.stringContaining('locked'),
+    );
+  });
+
+  it('reports what the prunes removed when the hand-off fails', async () => {
+    await insertEvent('dispatched', { dispatchState: 'dispatched', payload: null });
+    await insertAgedFailure();
+    jest.spyOn(reconciler, 'deadLetterAgedPending').mockRejectedValueOnce(new Error('queue unreachable'));
+
+    const result = await service.pruneOlderThan(7, 90);
+
+    expect(result).toEqual({ events: 1, failures: 1 });
+    expect(await events.count()).toBe(0);
+    expect(logError).toHaveBeenCalledWith(
+      'Integration ingress retention: undispatched event hand-off failed',
+      expect.stringContaining('queue unreachable'),
+    );
   });
 
   it('hands off a backlog larger than one batch', async () => {
@@ -610,10 +713,30 @@ describe('IntegrationRetentionService.pruneOlderThan with undispatched events', 
     expect(await failures.count()).toBe(250);
   });
 
+  it('lets the event loop run between rows, which a synchronous driver would otherwise starve for the whole pass', async () => {
+    for (let i = 0; i < 120; i++) await insertEvent(`y${i}`, {});
+    // better-sqlite3 answers every statement at once, so without a yield the pass is one unbroken chain of
+    // microtasks: no timer, request or keep-alive callback runs until it ends, however many rows it holds.
+    let ticks = 0;
+    let probing = true;
+    const probe = (): void => {
+      if (!probing) return;
+      ticks += 1;
+      setImmediate(probe);
+    };
+    setImmediate(probe);
+
+    await service.pruneOlderThan(7, 90);
+    probing = false;
+
+    expect(await events.count({ where: { dispatchState: 'failed' } })).toBe(120);
+    expect(ticks).toBeGreaterThan(60);
+  });
+
   it('prunes aged settled markers while the hand-off is still waiting', async () => {
     await insertEvent('dispatched', { dispatchState: 'dispatched', payload: null });
     await insertEvent('stranded', {});
-    // A job-state lookup against a queue that never became reachable does not return.
+    // A job-state lookup against a stalled Redis that has not returned yet.
     const lookedUp = new Promise<void>(resolve =>
       existingJobState.mockImplementation(() => {
         resolve();
@@ -627,7 +750,7 @@ describe('IntegrationRetentionService.pruneOlderThan with undispatched events', 
     expect((await events.find()).map(e => e.id)).toEqual(['stranded']);
   });
 
-  it('stops and keeps every row when no dead-letter write succeeds', async () => {
+  it('keeps every row when no dead-letter write succeeds', async () => {
     for (let i = 0; i < 100; i++) await insertEvent(`f${i}`, {});
     jest.spyOn(failures, 'save').mockRejectedValue(new Error('disk full'));
 
@@ -643,13 +766,114 @@ describe('IntegrationRetentionService.pruneOlderThan with undispatched events', 
     );
   });
 
-  it('keeps aged pending rows while a reconcile sweep holds the guard', async () => {
+  it('tries a row whose dead-letter write keeps failing once per run and hands off the rows behind it', async () => {
+    // A full batch of older rows whose write always fails, ahead of rows that hand off normally.
+    for (let i = 0; i < 100; i++) await insertEvent(`bad${i}`, { createdAt: daysAgo(9) });
+    for (let i = 0; i < 20; i++) await insertEvent(`ok${i}`, {});
+    const realSave = failures.save.bind(failures) as (
+      row: IntegrationDeliveryFailure,
+    ) => Promise<IntegrationDeliveryFailure>;
+    jest.spyOn(failures, 'save').mockImplementation(async row => {
+      const dlq = row as IntegrationDeliveryFailure;
+      if (dlq.deliveryId?.startsWith('d-bad')) throw new Error('row rejected');
+      return realSave(dlq);
+    });
+
+    await service.pruneOlderThan(7, 90);
+
+    expect(logError).toHaveBeenCalledTimes(100);
+    expect(await events.count({ where: { dispatchState: 'pending' } })).toBe(100);
+    expect(await events.count({ where: { dispatchState: 'failed' } })).toBe(20);
+    expect(await failures.count()).toBe(20);
+  });
+
+  it('stops a run once ten batches of rows could not be handed off', async () => {
+    for (let i = 0; i < 25; i++) await insertEvent(`f${i}`, {});
+    jest.spyOn(failures, 'save').mockRejectedValue(new Error('disk full'));
+
+    expect(await reconciler.deadLetterAgedPending(daysAgo(7), 2)).toBe(0);
+
+    expect(logError).toHaveBeenCalledTimes(20);
+    expect(await events.count({ where: { dispatchState: 'pending' } })).toBe(25);
+    expect(logWarn).toHaveBeenCalledWith(
+      'Ingress retention hand-off stopped early; the remaining events wait for the next run',
+      expect.objectContaining({ kept: 20, action: 'ingress_event_retention_handoff_stopped' }),
+    );
+  });
+
+  it('passes over pending rows whose payload is unreadable and hands off the rows behind them', async () => {
+    await insertEvent('unreadable1', { createdAt: daysAgo(9) });
+    await insertEvent('unreadable2', { createdAt: daysAgo(9) });
     await insertEvent('stranded', {});
-    (reconciler as unknown as { inFlight?: Promise<void> }).inFlight = new Promise(() => undefined);
+    // A JSON null passes the payload IS NOT NULL filter but reads back as no payload.
+    await events.query(`UPDATE ingress_events SET payload = 'null' WHERE id LIKE 'unreadable%'`);
+    const find = events.find.bind(events);
+    let fetches = 0;
+    jest.spyOn(events, 'find').mockImplementation(opts => {
+      if (++fetches > 5) throw new Error('the hand-off keeps fetching the same rows');
+      return find(opts);
+    });
 
-    const result = await service.pruneOlderThan(7, 90);
+    expect(await reconciler.deadLetterAgedPending(daysAgo(7), 2)).toBe(1);
 
-    expect(result.events).toBe(0);
+    expect(await events.findOneByOrFail({ id: 'stranded' })).toMatchObject({ dispatchState: 'failed', payload: null });
+    expect(await events.count({ where: { dispatchState: 'pending' } })).toBe(2);
+  });
+
+  // Stands in for a reconcile sweep holding the guard the hand-off shares with it.
+  const holdSweep = () => {
+    const guarded = reconciler as unknown as { inFlight?: Promise<void> };
+    let settle!: () => void;
+    guarded.inFlight = new Promise(resolve => (settle = resolve));
+    return () => {
+      guarded.inFlight = undefined;
+      settle();
+    };
+  };
+
+  // Resolves once the retention run has called the hand-off, with the hand-off's own promise.
+  const handOffCalled = () =>
+    new Promise<{ running: Promise<number> }>(resolve => {
+      const handOff = reconciler.deadLetterAgedPending.bind(reconciler);
+      jest.spyOn(reconciler, 'deadLetterAgedPending').mockImplementation((...args) => {
+        const running = handOff(...args);
+        resolve({ running });
+        return running;
+      });
+    });
+
+  it('waits for a running reconcile sweep, then hands off the aged pending rows', async () => {
+    await insertEvent('stranded', {});
+    const finishSweep = holdSweep();
+
+    const called = handOffCalled();
+    const pruned = service.pruneOlderThan(7, 90);
+    const { running } = await called;
+    const stateDuringSweep = await Promise.race([
+      running.then(() => 'returned'),
+      new Promise(resolve => setImmediate(resolve, 'waiting')),
+    ]);
+    const duringSweep = await events.findOneByOrFail({ id: 'stranded' });
+    finishSweep();
+    await pruned;
+
+    expect(stateDuringSweep).toBe('waiting');
+    expect(duringSweep.payload).not.toBeNull();
+    expect(await events.findOneByOrFail({ id: 'stranded' })).toMatchObject({ dispatchState: 'failed', payload: null });
+    expect(await failures.count()).toBe(1);
+  });
+
+  it('stops waiting for a running sweep once shutdown begins, and keeps the rows', async () => {
+    await insertEvent('stranded', {});
+    const finishSweep = holdSweep();
+
+    const called = handOffCalled();
+    const pruned = service.pruneOlderThan(7, 90);
+    await called;
+    const destroyed = reconciler.onModuleDestroy();
+    finishSweep();
+    await Promise.all([pruned, destroyed]);
+
     expect((await events.findOneByOrFail({ id: 'stranded' })).payload).not.toBeNull();
     expect(await failures.count()).toBe(0);
   });
@@ -660,18 +884,71 @@ describe('IntegrationRetentionService.pruneOlderThan with undispatched events', 
     const realSave = failures.save.bind(failures) as (
       row: IntegrationDeliveryFailure,
     ) => Promise<IntegrationDeliveryFailure>;
-    let destroyed: Promise<void> | undefined;
+    let saving!: () => void;
+    const entered = new Promise<void>(resolve => (saving = resolve));
+    let release!: () => void;
+    const held = new Promise<void>(resolve => (release = resolve));
     jest.spyOn(failures, 'save').mockImplementationOnce(async row => {
-      destroyed = reconciler.onModuleDestroy();
+      saving();
+      await held;
       return realSave(row as IntegrationDeliveryFailure);
     });
 
-    await service.pruneOlderThan(7, 90);
-    await destroyed;
+    const pruned = service.pruneOlderThan(7, 90);
+    await entered;
+    let destroyed = false;
+    const destroy = reconciler.onModuleDestroy().then(() => (destroyed = true));
+    await new Promise(setImmediate);
+    const destroyedWhileHeld = destroyed;
+    release();
+    await destroy;
+    const firstAtDestroy = (await events.findOneByOrFail({ id: 'first' })).dispatchState;
+    await pruned;
 
+    expect(destroyedWhileHeld).toBe(false);
+    expect(firstAtDestroy).toBe('failed');
     expect(await failures.count()).toBe(1);
     const rows = await events.find({ order: { createdAt: 'ASC' } });
     expect(rows.map(r => r.dispatchState)).toEqual(['failed', 'pending']);
     expect(rows[1].payload).not.toBeNull();
+  });
+
+  it('stops waiting on destroy for a hand-off lookup that does not return, and keeps its row', async () => {
+    await insertEvent('stranded', {});
+    let answer!: (state: undefined) => void;
+    const lookedUp = new Promise<void>(resolve =>
+      existingJobState.mockImplementation(() => {
+        resolve();
+        return new Promise(settle => (answer = settle));
+      }),
+    );
+
+    const pruned = service.pruneOlderThan(7, 90);
+    await lookedUp;
+    let destroyed = false;
+    let destroyedBeforeDeadline: boolean;
+    let destroyedAtDeadline: boolean;
+    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] });
+    try {
+      void reconciler.onModuleDestroy().then(() => (destroyed = true));
+      await jest.advanceTimersByTimeAsync(INGRESS_SHUTDOWN_WAIT_MS - 1);
+      await new Promise(setImmediate);
+      destroyedBeforeDeadline = destroyed;
+      await jest.advanceTimersByTimeAsync(1);
+      await new Promise(setImmediate);
+      destroyedAtDeadline = destroyed;
+    } finally {
+      jest.useRealTimers();
+    }
+    // The lookup returns once the queue connection closes later in shutdown; the row is left as it was.
+    answer(undefined);
+    await pruned;
+
+    expect(destroyedBeforeDeadline).toBe(false);
+    expect(destroyedAtDeadline).toBe(true);
+    expect(await failures.count()).toBe(0);
+    const row = await events.findOneByOrFail({ id: 'stranded' });
+    expect(row.dispatchState).toBe('pending');
+    expect(row.payload).not.toBeNull();
   });
 });

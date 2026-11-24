@@ -1,12 +1,18 @@
-import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { Injectable, OnModuleDestroy, OnModuleInit, Optional } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { MoreThan, Repository } from 'typeorm';
 import { Webhook } from './entities/webhook.entity';
+import { WebhookDeliveryFailure } from './entities/webhook-delivery-failure.entity';
 import { WebhookOutboxService } from './webhook-outbox.service';
-import { isAbortedBackoff, WebhookDeliveryService } from './webhook-delivery.service';
+import {
+  DEFAULT_WEBHOOK_SHUTDOWN_DRAIN_MS,
+  isAbortedBackoff,
+  WebhookDeliveryService,
+} from './webhook-delivery.service';
 import { isDeliverableWebhook } from './utils/deliver-once';
 import { createLogger } from '../../common/services/logger.service';
-import { resolveNonNegativeIntEnv } from '../../config/configuration';
+import { MAX_TIMER_MS, resolveNonNegativeIntEnv } from '../../config/configuration';
 
 export interface WebhookReconcilerOptions {
   /** 0 disables the sweep entirely. */
@@ -71,6 +77,10 @@ export class WebhookReconcilerService implements OnModuleInit, OnModuleDestroy {
     @InjectRepository(Webhook, 'data') private readonly webhooks: Repository<Webhook>,
     private readonly outbox: WebhookOutboxService,
     private readonly delivery: WebhookDeliveryService,
+    private readonly configService: ConfigService,
+    @Optional()
+    @InjectRepository(WebhookDeliveryFailure, 'data')
+    private readonly deliveryFailures?: Repository<WebhookDeliveryFailure>,
   ) {}
 
   onModuleInit(): void {
@@ -91,12 +101,32 @@ export class WebhookReconcilerService implements OnModuleInit, OnModuleDestroy {
    * Clearing the interval only stops the NEXT pass. A replay holds no dispatch slot, so the delivery
    * drain neither waits for nor stops a pass already running: it would go on POSTing after the drain,
    * and after PluginLoaderService has unregistered the `webhook:before` hooks. Stop it at the next row,
-   * stop the replay in hand without a further retry, and wait for it.
+   * stop the replay in hand without a further retry, and wait for it, at most WEBHOOK_SHUTDOWN_DRAIN_MS
+   * like the delivery drain beside it: the replay's hooks are not capped, and a queue lookup or add made
+   * before Redis has ever connected waits up to REDIS_CONNECT_TIMEOUT_MS. A row given up on stays
+   * 'pending' unless the replay in hand completes before the process exits.
    */
   async onModuleDestroy(): Promise<void> {
     this.stop.abort();
     if (this.timer) clearInterval(this.timer);
-    await this.inFlight;
+    if (!this.inFlight) return;
+    // Above MAX_TIMER_MS a Node timer fires after 1 ms; the delivery drain honours such a value in full.
+    const waitMs = Math.min(
+      this.configService.get<number>('webhook.shutdownDrainMs', DEFAULT_WEBHOOK_SHUTDOWN_DRAIN_MS),
+      MAX_TIMER_MS,
+    );
+    let timer: NodeJS.Timeout | undefined;
+    const settled = await Promise.race([
+      this.inFlight.then(() => true),
+      new Promise<false>(resolve => (timer = setTimeout(resolve, waitMs, false))),
+    ]);
+    clearTimeout(timer);
+    if (!settled) {
+      this.logger.warn('Webhook reconcile pass still running at shutdown; continuing without it', {
+        waitMs,
+        action: 'webhook_reconcile_shutdown_timeout',
+      });
+    }
   }
 
   /** One bounded pass over the stranded backlog. Overlap-guarded. */
@@ -107,14 +137,31 @@ export class WebhookReconcilerService implements OnModuleInit, OnModuleDestroy {
     this.inFlight = new Promise(resolve => (settle = resolve));
     try {
       const cutoff = new Date(now.getTime() - opts.graceMs);
-      let rows = await this.outbox.findStale(cutoff, opts.batchSize, this.cursor);
-      if (rows.length === 0 && this.cursor) {
+      // The last id the page covered, which can lie beyond its last readable row: a row whose stored
+      // payload is unreadable is skipped, and the cursor must pass it or a page of them is read forever.
+      let scannedThrough: string | undefined;
+      let covered = 0;
+      const onScanned = (id: string, count: number): void => {
+        scannedThrough = id;
+        covered = count;
+      };
+      let rows = await this.outbox.findStale(cutoff, opts.batchSize, this.cursor, onScanned);
+      if (rows.length === 0 && !scannedThrough && this.cursor) {
         this.cursor = undefined;
-        rows = await this.outbox.findStale(cutoff, opts.batchSize);
+        rows = await this.outbox.findStale(cutoff, opts.batchSize, undefined, onScanned);
       }
-      // Live jobs may occupy a whole page. Advance past them without spending their replay budget.
-      this.cursor = rows.at(-1)?.id;
+      // Live jobs may occupy a whole page. Advance past them without spending their replay budget. A page that did not
+      // fill its batch has reached the end of the stale rows, so the next pass starts at the oldest again: a row left
+      // behind the cursor, whose job was live when it was read and is lost since, would otherwise wait for as long as
+      // newer stale rows keep arriving.
+      const pageFull = Math.max(covered, rows.length) >= opts.batchSize;
+      this.cursor = pageFull ? (scannedThrough ?? rows.at(-1)?.id) : undefined;
       stats.scanned = rows.length;
+      // Webhooks whose replay did not deliver in this pass. Direct mode replays one row at a time with
+      // the full retry schedule, so a receiver that never answers would cost that schedule per stranded
+      // row and hold every webhook behind it. The first failure has shown it is down: its further rows
+      // make one attempt each, and the next sweep is their retry.
+      const failedWebhooks = new Set<string>();
       for (const row of rows) {
         if (this.stop.signal.aborted) break;
         if (this.delivery.isLocallyPending(row.idempotencyKey)) {
@@ -136,6 +183,25 @@ export class WebhookReconcilerService implements OnModuleInit, OnModuleDestroy {
         if (row.deliveryId && (await this.delivery.isQueueJobPending(row.deliveryId))) {
           stats.skipped++;
           continue;
+        }
+        if (row.deliveryId && (await this.delivery.hasQueueJobCompleted(row.deliveryId))) {
+          // A worker settled this job and its outbox row was left behind (a worker that never closes the
+          // outbox, or a close that failed). It is not stranded: a replay would POST an event the receiver
+          // already has, up to the budget, and then record a failure for a delivery that succeeded.
+          await this.outbox.close(row.webhookId, row.idempotencyKey, 'dispatched');
+          stats.skipped++;
+          continue;
+        }
+        if (row.state === 'queued' && this.deliveryFailures) {
+          const terminalFailure = await this.deliveryFailures.findOne({
+            select: { id: true },
+            where: { webhookId: row.webhookId, idempotencyKey: row.idempotencyKey, attempts: MoreThan(0) },
+          });
+          if (terminalFailure) {
+            await this.outbox.close(row.webhookId, row.idempotencyKey, 'failed');
+            stats.skipped++;
+            continue;
+          }
         }
         if (row.attempts >= opts.maxAttempts) {
           // A database fault may have prevented every terminal failure write. Keep the outbox
@@ -165,17 +231,18 @@ export class WebhookReconcilerService implements OnModuleInit, OnModuleDestroy {
             row.event,
             row.idempotencyKey,
             row.payload,
-            { signal: this.stop.signal },
+            { signal: this.stop.signal, oneDirectAttempt: failedWebhooks.has(row.webhookId) },
           );
           if (outcome === 'failed' || outcome === 'unrecorded') {
             // Left 'pending' on purpose: the next sweep retries it until the budget is spent.
             this.logger.warn(`Replay of ${row.event} to webhook ${row.webhookId} did not deliver`);
+            failedWebhooks.add(row.webhookId);
             stats.failed++;
             continue;
           }
-          // Enqueued rows retain their copy until the worker settles them. Success and deliberate
-          // cancellation can retire immediately.
-          if (outcome !== 'enqueued') await this.outbox.close(row.webhookId, row.idempotencyKey, 'dispatched');
+          // Enqueued rows retain their copy until the worker settles them, and redeliver has already
+          // retired a delivered one. A deliberate cancellation retires here.
+          if (outcome === 'cancelled') await this.outbox.close(row.webhookId, row.idempotencyKey, 'dispatched');
           stats.replayed++;
         } catch (error) {
           // A replay cut short in its retry backoff by shutdown was interrupted, not failed. Any other

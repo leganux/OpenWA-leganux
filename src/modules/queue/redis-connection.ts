@@ -1,13 +1,114 @@
-import { resolveNonNegativeIntEnv } from '../../config/configuration';
-import { redisConnectionOptions, type RedisConnectionOptions } from '../../config/redis-options';
+import type { Queue } from 'bullmq';
+import { MAX_TIMER_MS, resolveNonNegativeIntEnv } from '../../config/configuration';
+import {
+  DEFAULT_REDIS_CONNECT_TIMEOUT_MS,
+  redisConnectionOptions,
+  type RedisConnectionOptions,
+} from '../../config/redis-options';
+
+/** Upper bound for one producer command once connected. Same bound as the throttler's Redis client. */
+export const QUEUE_COMMAND_TIMEOUT_MS = 2000;
+
+/**
+ * How long the producer's socket may stay silent after a write before it is destroyed. Kept strictly
+ * below QUEUE_COMMAND_TIMEOUT_MS so the dead socket is torn down before the first stalled command's
+ * own deadline: subsequent producer calls then reject immediately through enableOfflineQueue: false
+ * instead of each waiting out another full command timeout on the same silent socket.
+ */
+export const QUEUE_SOCKET_TIMEOUT_MS = 1500;
 
 /**
  * BullMQ connection for the shared producer (`BullModule.forRootAsync` in queue.module.ts): the common
- * Redis fields plus `enableOfflineQueue: false`, so `queue.add()` fails fast when Redis is unreachable
- * and the dispatch path can fall back to direct delivery instead of buffering forever.
+ * Redis fields plus `enableOfflineQueue: false`, so once connected, `queue.add()` fails fast when Redis
+ * drops and the dispatch path can fall back to direct delivery instead of buffering forever. Before the
+ * first connect that option never applies: see producerReady.
+ *
+ * `commandTimeout`, `socketTimeout`, and `autoResendUnfulfilledCommands: false` cover the other failure:
+ * a Redis that stays connected and stops answering (a network partition, a frozen process). `socketTimeout`
+ * tears down the dead socket before `commandTimeout` expires so callers after the first stalled command
+ * fast-fail instead of waiting another 2 s each; `autoResendUnfulfilledCommands: false` prevents an
+ * already-timed-out enqueue from being silently replayed after reconnect while the direct fallback ran;
+ * and `commandTimeout` settles the dropped in-flight command so callers never hang. The Worker connection
+ * below must not inherit any of these: its blocking commands wait on Redis by design.
  */
-export function queueConnectionOptions(): RedisConnectionOptions & { enableOfflineQueue: false } {
-  return { ...redisConnectionOptions(), enableOfflineQueue: false };
+export function queueConnectionOptions(): RedisConnectionOptions & {
+  enableOfflineQueue: false;
+  commandTimeout: number;
+  socketTimeout: number;
+  autoResendUnfulfilledCommands: false;
+} {
+  return {
+    ...redisConnectionOptions(),
+    enableOfflineQueue: false,
+    commandTimeout: QUEUE_COMMAND_TIMEOUT_MS,
+    socketTimeout: QUEUE_SOCKET_TIMEOUT_MS,
+    autoResendUnfulfilledCommands: false,
+  };
+}
+
+/**
+ * Redis key prefix of the BullMQ queues, handed to every Queue and Worker through the shared module
+ * options. Unset keeps BullMQ's own `bull`, so jobs queued by an earlier version are still found after
+ * an upgrade. A queue is named only by this prefix and its name, so two deployments on one Redis must
+ * each set their own: otherwise one's workers take the other's webhook jobs, find no such webhook in
+ * their own database and complete them without delivering. Replicas of one deployment share a value.
+ */
+export function queuePrefix(): string | undefined {
+  return process.env.QUEUE_PREFIX?.trim() || undefined;
+}
+
+/** `BullModule.forRootAsync` options: the producer connection, plus the prefix when one is set. */
+export function queueRootOptions(): { connection: ReturnType<typeof queueConnectionOptions>; prefix?: string } {
+  const prefix = queuePrefix();
+  return { connection: queueConnectionOptions(), ...(prefix ? { prefix } : {}) };
+}
+
+/**
+ * How long producerReady waits for a producer queue's first connect: REDIS_CONNECT_TIMEOUT_MS, or the
+ * default when it is 0 (see producerReady), capped at MAX_TIMER_MS. Above that a Node timer fires after
+ * 1 ms, which would bypass a healthy Redis at boot. Node truncates ioredis's socket connect timeout to
+ * the same ceiling.
+ */
+export function producerConnectWaitMs(): number {
+  return Math.min(redisConnectionOptions().connectTimeout || DEFAULT_REDIS_CONNECT_TIMEOUT_MS, MAX_TIMER_MS);
+}
+
+/** Per producer queue: whether its first connect has landed, and the shared wait for it. */
+const firstConnects = new WeakMap<object, { connected: boolean; wait: Promise<void> }>();
+
+/**
+ * Resolve once a producer queue has connected; reject if its first connect has not landed within
+ * REDIS_CONNECT_TIMEOUT_MS of the first call. Until that connect, BullMQ holds every queue call without
+ * sending a command, and its default retry strategy never gives up, so with Redis unreachable since
+ * boot a call never settles. Await this before each producer call so the caller's fallback runs
+ * instead. The wait is opened once per queue and shared: calls inside that window wait for its end,
+ * later calls reject at once until Redis connects (each call subscribing to BullMQ's pending connect
+ * would hold memory until it lands), and any call after a connect resolves at once. A setting of 0
+ * (no socket connect timeout in ioredis) still opens a window of the default: rejecting at once would
+ * bypass a healthy queue during startup, and waiting forever would bring the hang back. The window's
+ * timer is unref'd, so a wait still open at shutdown never holds the process alive.
+ */
+export async function producerReady(queue: Pick<Queue, 'waitUntilReady'>): Promise<void> {
+  let first = firstConnects.get(queue);
+  if (!first) {
+    const timeoutMs = producerConnectWaitMs();
+    const ready = queue.waitUntilReady();
+    let timer: NodeJS.Timeout | undefined;
+    const wait = Promise.race([
+      ready,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`Redis has not connected within ${timeoutMs}ms`)), timeoutMs);
+        timer.unref();
+      }),
+    ]).finally(() => clearTimeout(timer));
+    const entry = { connected: false, wait };
+    ready.then(
+      () => (entry.connected = true),
+      () => undefined,
+    );
+    firstConnects.set(queue, (first = entry));
+  }
+  if (!first.connected) await first.wait;
 }
 
 /**
@@ -47,14 +148,16 @@ export function webhookWorkerConcurrency(): number {
 const DEFAULT_INGRESS_WORKER_CONCURRENCY = 10;
 
 /**
- * Ingress Worker concurrency. Ordering within a conversation is now guaranteed by the
- * per-conversation KeyedAsyncLock in the processor, not by a single-worker queue, so raising
- * concurrency here parallelizes unrelated conversations. A job waiting on a busy key still holds a
- * slot, though: a burst on one key larger than this value blocks every other key until it drains.
- * Size it above the largest expected per-key burst; the key is the whole instance unless the route
- * declares a conversationId pointer. Override via INGRESS_WORKER_CONCURRENCY; unset or blank uses
- * the default, and any other value that is not a positive integer fails boot validation
- * (env.validation.ts).
+ * Ingress Worker concurrency. Ordering within a conversation is guaranteed per ordering key in
+ * IngressProcessor, not by a single-worker queue, so raising concurrency here parallelizes
+ * unrelated conversations. When a BullMQ job arrives for a key already running in this worker,
+ * IngressProcessor defers it back to the delayed set via DelayedError rather than holding a worker
+ * slot, so a burst on one slow key no longer head-of-line-blocks unrelated keys; KeyedAsyncLock
+ * remains as the in-process fallback for direct or token-less callers. Size this value to the
+ * number of distinct conversations you want executing concurrently; the key is the whole instance
+ * unless the route declares a conversationId pointer. Override via INGRESS_WORKER_CONCURRENCY;
+ * unset or blank uses the default, and any other value that is not a positive integer fails boot
+ * validation (env.validation.ts).
  */
 export function ingressWorkerConcurrency(): number {
   return resolveNonNegativeIntEnv(process.env.INGRESS_WORKER_CONCURRENCY, 0) || DEFAULT_INGRESS_WORKER_CONCURRENCY;

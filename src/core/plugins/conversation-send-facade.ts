@@ -13,10 +13,12 @@ export interface ConversationSendDeps {
   assertSessionActive: (sessionId: string) => void;
   // Resolve the WA chat id from conversation_mappings when the envelope omits chatId.
   resolveChatId: (env: ConversationSendEnvelope) => Promise<string>;
-  // Seed the hook in-flight set so an adapter's own outbound message:sending hook cannot echo-loop
-  // back into this same send. Only 'message:sending' is reachable this way — MessageService fires it
-  // synchronously inside sendText/reply. 'message:sent' is emitted later by SessionEngineLifecycle's
-  // engine callback (onMessageCreate), outside this call's async scope, so seeding it here would be a no-op.
+  // Run the send inside the hook context the caller is already in, when it is in one: a send from a hook
+  // handler then cannot re-fire that handler's own message:sending event. A send from an ingress handler
+  // is in no hook context and runs the full chain. Only 'message:sending' is reachable this way,
+  // because MessageService fires it synchronously inside sendText/reply. 'message:sent' is emitted later
+  // by SessionEngineLifecycle's engine callback (onMessageCreate), outside this call's async scope, so
+  // seeding it here would be a no-op.
   runGuarded: <T>(events: string[], run: () => Promise<T>) => Promise<T>;
   sendText: (sessionId: string, opts: { chatId: string; text: string; linkPreview?: boolean }) => Promise<unknown>;
   reply: (sessionId: string, opts: { chatId: string; quotedMessageId: string; text: string }) => Promise<unknown>;
@@ -48,7 +50,7 @@ const isValidLatitude = (v: unknown): v is number => typeof v === 'number' && Nu
 const isValidLongitude = (v: unknown): v is number =>
   typeof v === 'number' && Number.isFinite(v) && v >= -180 && v <= 180;
 
-const MESSAGE_HOOK_EVENTS = ['message:sending'];
+const MESSAGE_HOOK_EVENTS = ['message:sending', 'message:sent'];
 
 export function buildConversationSendFacade(deps: ConversationSendDeps) {
   return {
@@ -57,8 +59,8 @@ export function buildConversationSendFacade(deps: ConversationSendDeps) {
       const sessionId = env.sessionId;
       if (!sessionId) throw new PluginCapabilityError('conversation.send: sessionId is required');
       deps.assertSessionActive(sessionId);
-      const chatId = env.chatId ?? (await deps.resolveChatId(env));
       return deps.runGuarded(MESSAGE_HOOK_EVENTS, async () => {
+        const chatId = env.chatId ?? (await deps.resolveChatId(env));
         // A location envelope is delivered as a native location pin. Without valid coordinates there
         // is NOTHING to send — reject loudly instead of degrading to an empty text message.
         if (env.type === 'location') {

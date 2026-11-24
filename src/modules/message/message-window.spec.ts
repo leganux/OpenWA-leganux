@@ -120,7 +120,7 @@ describe('message-time selection', () => {
     const page = await service.getMessages('s1', { chatId: '100@g.us', orderBy: 'timestamp', limit: 1 });
     const anchor = page.messages[0];
     for (const options of [
-      { chatId: '200@g.us', after: anchor.id },
+      { messageId: 'non-existent-wamid', after: anchor.id },
       { until: 1000_000, after: anchor.id },
       { after: randomUUID() },
     ])
@@ -129,6 +129,73 @@ describe('message-time selection', () => {
     await expect(service.getMessages('s1', { orderBy: 'timestamp', after: anchor.id })).rejects.toThrow(
       'Unknown cursor',
     );
+  });
+
+  it('continues keyset pagination when chatId or from LID mappings change between pages', async () => {
+    const repo = ds.getRepository(Message);
+    const first = await repo.save({
+      sessionId: 's1',
+      chatId: '77777@lid',
+      from: '77777@lid',
+      to: 'me@c.us',
+      body: 'page 1 via lid',
+      type: 'text',
+      direction: MessageDirection.INCOMING,
+      timestamp: 2000,
+    });
+    const second = await repo.save({
+      sessionId: 's1',
+      chatId: '628999@c.us',
+      from: '628999@c.us',
+      to: 'me@c.us',
+      body: 'page 2 via pn',
+      type: 'text',
+      direction: MessageDirection.INCOMING,
+      timestamp: 1990,
+    });
+
+    const page = await service.getMessages('s1', {
+      chatId: '628999@c.us',
+      direction: MessageDirection.INCOMING,
+      type: 'text',
+      since: 1900_000,
+      until: 2100_000,
+      orderBy: 'timestamp',
+      after: first.id,
+    });
+    expect(page.messages.map(m => m.id)).toEqual([second.id]);
+  });
+
+  // The membership check is switched on by the selection itself. orderBy 'timestamp' does that alone,
+  // so the cases below keep the default order: each filter has to switch the check on in its own right.
+  it.each(['direction', 'type', 'since', 'until'] as const)(
+    'rejects a cursor outside a selection narrowed only by %s',
+    async filter => {
+      const repo = ds.getRepository(Message);
+      await repo.update({ waMessageId: 'm10' }, { type: 'image' });
+      const row = (waMessageId: string): Promise<Message> => repo.findOneByOrFail({ waMessageId });
+      // m1 is outgoing and m11 is text; m0 is the oldest in message time and m200 is newer than 1010 s.
+      const cases = {
+        direction: [{ direction: MessageDirection.INCOMING }, await row('m1')],
+        type: [{ type: 'image' }, await row('m11')],
+        since: [{ since: 1050_000 }, await row('m0')],
+        until: [{ until: 1010_000 }, await row('m200')],
+      } as const;
+      const [selection, anchor] = cases[filter];
+
+      await expect(service.getMessages('s1', { ...selection, after: anchor.id })).rejects.toThrow(
+        'Unknown cursor for this message selection',
+      );
+    },
+  );
+
+  it.each([
+    ['since', { since: 1000_000 }],
+    ['until', { until: 1060_000 }],
+  ] as const)('counts the rows without a message time when only %s bounds the selection', async (_bound, options) => {
+    const page = await service.getMessages('s1', options);
+
+    expect(page.unknownTimestampTotal).toBe(1);
   });
 
   it('keeps legacy ingestion order and unknown-time rows when new options are absent', async () => {
@@ -164,6 +231,18 @@ describe('message-time selection', () => {
     const plan = await ds.query<{ detail: string }[]>(`EXPLAIN QUERY PLAN ${page.sql}`, page.params);
     expect(plan.map((r: { detail: string }) => r.detail).join(' ')).toContain(index);
     expect(plan.map((r: { detail: string }) => r.detail).join(' ')).not.toContain('TEMP B-TREE');
+  });
+
+  // A user chat expands to several id candidates (one per dialect). SQLite has no planner statistics
+  // here, so a plain sort key makes it walk the session's whole time index and filter the chat row by
+  // row; the unary plus on the key makes it seek the chat index and sort only that chat's rows.
+  it('seeks the chat index, not the session time index, for a user chat with several id candidates', async () => {
+    await service.getMessages('s1', { orderBy: 'timestamp', chatId: '1001@c.us', since: 1000_000, until: 1060_000 });
+    const page = queries.find(q => q.sql.includes('ORDER BY') && q.sql.includes('LIMIT'))!;
+    const plan = await ds.query<{ detail: string }[]>(`EXPLAIN QUERY PLAN ${page.sql}`, page.params);
+    const details = plan.map((r: { detail: string }) => r.detail).join(' ');
+    expect(details).toContain('IDX_messages_session_chat_timestamp_id');
+    expect(details).not.toContain('IDX_messages_session_timestamp_id');
   });
 
   it('migration preserves rows when applied and reverted', async () => {

@@ -1,5 +1,3 @@
-import { readFileSync } from 'fs';
-import { join } from 'path';
 import { Global, Module } from '@nestjs/common';
 import { GLOBAL_MODULE_METADATA, MODULE_METADATA } from '@nestjs/common/constants';
 import { ConfigService } from '@nestjs/config';
@@ -15,9 +13,8 @@ import { QueueModule } from './queue.module';
 import { MAX_WORKER_CLOSE_WAIT_MS } from './processors/close-worker';
 import { PluginLoaderService } from '../../core/plugins/plugin-loader.service';
 import { HookManager } from '../../core/hooks';
-import { DEFAULT_SHUTDOWN_DELAY_MS } from '../../common/services/shutdown.service';
-import configuration from '../../config/configuration';
-import { ApiKeyUsageTracker } from '../auth/api-key-usage-tracker.service';
+import { ShutdownService } from '../../common/services/shutdown.service';
+import { LoggerModule } from '../../common/services/logger.module';
 import { IntegrationDeliveryFailure } from '../integration/entities/integration-delivery-failure.entity';
 import { IngressEvent } from '../integration/entities/ingress-event.entity';
 import { Webhook } from '../webhook/entities/webhook.entity';
@@ -60,7 +57,7 @@ class FakeQueue {
 
 let pluginTeardownRan = false;
 
-function buildRootModule(openAtPluginTeardown: string[]) {
+function buildRootModule(openAtPluginTeardown: string[], openAtSessionTeardown: string[] = []) {
   class PluginLoaderStub {
     onModuleDestroy(): void {
       pluginTeardownRan = true;
@@ -94,7 +91,17 @@ function buildRootModule(openAtPluginTeardown: string[]) {
   })
   class QueueStubModule {}
 
-  @Module({ imports: [PluginsStubModule, QueueStubModule] })
+  // SessionModule sits closer to the root than QueueModule, so Nest destroys it, and the engines with
+  // it, before the processors' own destroy hooks run.
+  class SessionStub {
+    onModuleDestroy(): void {
+      openAtSessionTeardown.push(...FakeWorker.all.filter(w => !w.closed).map(w => w.name));
+    }
+  }
+  @Module({ imports: [QueueStubModule], providers: [SessionStub] })
+  class SessionStubModule {}
+
+  @Module({ imports: [LoggerModule, PluginsStubModule, SessionStubModule] })
   class RootModule {}
   return RootModule;
 }
@@ -131,6 +138,25 @@ describe('queue workers at shutdown', () => {
     expect(openAtPluginTeardown).toEqual([]);
   });
 
+  // A plugin's ingress handler sends through the session engines, so a job taken once they are torn
+  // down fails and spends an attempt. The worker stops taking jobs when shutdown begins instead.
+  it('stops taking ingress jobs before the sessions are torn down', async () => {
+    const openAtSessionTeardown: string[] = [];
+    const app = await NestFactory.createApplicationContext(buildRootModule([], openAtSessionTeardown), {
+      logger: false,
+    });
+
+    const log = jest.spyOn(console, 'log').mockImplementation(() => undefined);
+    try {
+      app.get(ShutdownService).markShuttingDown();
+      await app.close();
+    } finally {
+      log.mockRestore();
+    }
+
+    expect(openAtSessionTeardown).not.toContain(QUEUE_NAMES.INGRESS);
+  });
+
   // The early close must not leave the plugins up forever when Redis is gone: past the bounded wait the
   // global destroy hooks run, as they did when the workers were only closed at application shutdown.
   it('stops waiting for a worker that cannot close and still tears down the plugins', async () => {
@@ -139,12 +165,15 @@ describe('queue workers at shutdown', () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     jest.useFakeTimers();
     try {
-      void app.close();
+      const closing = app.close();
       await jest.advanceTimersByTimeAsync(MAX_WORKER_CLOSE_WAIT_MS - 1);
       expect(pluginTeardownRan).toBe(false);
 
       await jest.advanceTimersByTimeAsync(1);
       expect(pluginTeardownRan).toBe(true);
+      // BullModule awaits the same worker close again in onApplicationShutdown, ahead of the DataSource
+      // close; it must not wait on the close that never settles.
+      await expect(closing).resolves.toBeUndefined();
       const warned = warn.mock.calls.flat().join('\n');
       expect(warned).toContain(QUEUE_NAMES.INGRESS);
       expect(warned).toContain(QUEUE_NAMES.WEBHOOK);
@@ -152,26 +181,6 @@ describe('queue workers at shutdown', () => {
       jest.useRealTimers();
       warn.mockRestore();
     }
-  });
-
-  // The global destroy hooks run after the capped wait, so the cap must leave them room inside the
-  // shipped kill deadline after what shutdown spends before QueueModule is destroyed: SHUTDOWN_DELAY_MS,
-  // the per-engine destroy deadline (engines torn down in parallel) and WEBHOOK_SHUTDOWN_DRAIN_MS; then
-  // the bounded API-key usage flush. The defaults come from their sources, so raising one fails here.
-  it('leaves the global destroy hooks room inside the shipped kill deadline', () => {
-    const root = join(__dirname, '../../..');
-    const compose = readFileSync(join(root, 'docker-compose.yml'), 'utf8');
-    const values = readFileSync(join(root, 'charts/openwa/values.yaml'), 'utf8');
-    const graceMs = [
-      Number(/^\s+stop_grace_period: (\d+)s$/m.exec(compose)?.[1]) * 1000,
-      Number(/^terminationGracePeriodSeconds: (\d+)$/m.exec(values)?.[1]) * 1000,
-    ];
-
-    // Hard-coded: an inline literal in SessionLifecycleFences.teardownEngineSafely, not exported.
-    const engineTeardown = 10_000;
-    const beforeQueueClose = DEFAULT_SHUTDOWN_DELAY_MS + engineTeardown + configuration().webhook.shutdownDrainMs;
-    const usageFlush = ApiKeyUsageTracker.SHUTDOWN_FLUSH_TIMEOUT_MS;
-    expect(beforeQueueClose + MAX_WORKER_CLOSE_WAIT_MS + usageFlush).toBeLessThan(Math.min(...graceMs));
   });
 
   // A bootstrap that fails before listen() closes an app whose workers were never created; the destroy

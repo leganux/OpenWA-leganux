@@ -89,6 +89,20 @@ describe('configuration — Puppeteer args delimiter', () => {
       `--lang=${PINNED_BROWSER_LOCALE}`,
     ]);
   });
+
+  it.each(['   ', ',,,', ' , , '])(
+    'falls back to the default sandbox flag set when PUPPETEER_ARGS=%j parses to zero flags',
+    blankOrCommas => {
+      process.env.PUPPETEER_ARGS = blankOrCommas;
+      expect(configuration().engine.puppeteer.args).toEqual([
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        `--lang=${PINNED_BROWSER_LOCALE}`,
+      ]);
+    },
+  );
 });
 
 describe('configuration — Postgres pool timeouts', () => {
@@ -261,7 +275,7 @@ describe('configuration — webhook fan-out knobs are fail-safe', () => {
 describe('configuration search namespace', () => {
   // Save/restore the SEARCH_* env vars so a CI .env that sets them cannot flake the default-value
   // assertions below (mirrors the mutate-and-restore pattern used for PLUGIN_DOWNLOAD_MAX_BYTES etc.).
-  const keys = ['SEARCH_ENABLED', 'SEARCH_PROVIDER'];
+  const keys = ['SEARCH_ENABLED', 'SEARCH_PROVIDER', 'SEARCH_CONTAINS_ENABLED'];
   const orig: Record<string, string | undefined> = {};
   beforeEach(() => keys.forEach(k => (orig[k] = process.env[k])));
   afterEach(() =>
@@ -274,7 +288,7 @@ describe('configuration search namespace', () => {
   it('exposes search defaults', () => {
     keys.forEach(k => delete process.env[k]);
     const cfg = configuration();
-    expect(cfg.search).toEqual({ enabled: true, provider: 'auto' });
+    expect(cfg.search).toEqual({ enabled: true, provider: 'auto', containsEnabled: false });
   });
 });
 
@@ -364,6 +378,50 @@ describe('configuration — webhook shutdown drain is fail-safe', () => {
   });
 });
 
+describe('configuration: webhook failure payload retention', () => {
+  const orig = process.env.WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS;
+  afterEach(() => {
+    if (orig === undefined) delete process.env.WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS;
+    else process.env.WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS = orig;
+  });
+
+  // 0 keeps no message body on a failure row, so a changed default would start persisting every
+  // failed delivery's event data on every deployment that never opted in.
+  it('keeps no payload by default and honors an hours override', () => {
+    delete process.env.WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS;
+    expect(configuration().webhook.failurePayloadRetentionHours).toBe(0);
+    process.env.WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS = '24';
+    expect(configuration().webhook.failurePayloadRetentionHours).toBe(24);
+  });
+
+  it('falls back to keeping nothing on a value it cannot read', () => {
+    for (const bad of ['', '24h', '-1', '1.5']) {
+      process.env.WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS = bad;
+      expect(configuration().webhook.failurePayloadRetentionHours).toBe(0);
+    }
+  });
+});
+
+describe('configuration: chat media inline mode', () => {
+  const orig = process.env.MESSAGE_INLINE_MEDIA;
+  afterEach(() => {
+    if (orig === undefined) delete process.env.MESSAGE_INLINE_MEDIA;
+    else process.env.MESSAGE_INLINE_MEDIA = orig;
+  });
+
+  // Archive mode replaces the stored inline copy, so only the exact word turns it on.
+  it('stays inline unless the value is exactly archive', () => {
+    delete process.env.MESSAGE_INLINE_MEDIA;
+    expect(configuration().chatMedia.inlineMode).toBe('inline');
+    for (const other of ['inline', 'Archive', 'ARCHIVE', ' archive', 'archive ', 'true']) {
+      process.env.MESSAGE_INLINE_MEDIA = other;
+      expect(configuration().chatMedia.inlineMode).toBe('inline');
+    }
+    process.env.MESSAGE_INLINE_MEDIA = 'archive';
+    expect(configuration().chatMedia.inlineMode).toBe('archive');
+  });
+});
+
 describe('resolveNonNegativeIntEnv', () => {
   it('treats blank/whitespace as unset and falls back (never the 0 opt-out sentinel)', () => {
     // Number('') is 0, which would otherwise pass a finite && >= 0 guard and silently land on
@@ -433,5 +491,117 @@ describe('configuration — puppeteer locale pin', () => {
   it('respects an explicit --lang inside PUPPETEER_ARGS', () => {
     process.env.PUPPETEER_ARGS = '--no-sandbox --lang=id-ID';
     expect(configuration().engine.puppeteer.args).toEqual(['--no-sandbox', '--lang=id-ID']);
+  });
+});
+
+describe('configuration SQLite journal mode', () => {
+  const orig = process.env.SQLITE_JOURNAL_MODE;
+
+  afterEach(() => {
+    if (orig === undefined) delete process.env.SQLITE_JOURNAL_MODE;
+    else process.env.SQLITE_JOURNAL_MODE = orig;
+  });
+
+  it('defaults both database and dataDatabase journalMode to WAL when unset or blank', () => {
+    delete process.env.SQLITE_JOURNAL_MODE;
+    const cfg = configuration() as unknown as {
+      database: { journalMode?: string };
+      dataDatabase: { journalMode?: string };
+    };
+    expect(cfg.database.journalMode).toBe('WAL');
+    expect(cfg.dataDatabase.journalMode).toBe('WAL');
+
+    process.env.SQLITE_JOURNAL_MODE = '   ';
+    const blankCfg = configuration() as unknown as {
+      database: { journalMode?: string };
+      dataDatabase: { journalMode?: string };
+    };
+    expect(blankCfg.database.journalMode).toBe('WAL');
+    expect(blankCfg.dataDatabase.journalMode).toBe('WAL');
+  });
+
+  it('honors SQLITE_JOURNAL_MODE=DELETE on both database namespaces', () => {
+    process.env.SQLITE_JOURNAL_MODE = 'DELETE';
+    const cfg = configuration() as unknown as {
+      database: { journalMode?: string };
+      dataDatabase: { journalMode?: string };
+    };
+    expect(cfg.database.journalMode).toBe('DELETE');
+    expect(cfg.dataDatabase.journalMode).toBe('DELETE');
+  });
+});
+
+describe('configuration pre-egress hook and browser session settings', () => {
+  const keys = ['HOOK_PRE_EGRESS_FAIL_CLOSED', 'DASHBOARD_SESSION_TTL_MS', 'DASHBOARD_SESSION_COOKIE_SECURE'] as const;
+  const saved: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    for (const key of keys) {
+      saved[key] = process.env[key];
+      delete process.env[key];
+    }
+  });
+
+  afterEach(() => {
+    for (const key of keys) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+  });
+
+  it('exposes safe defaults when hook and browser session env vars are unset', () => {
+    const cfg = configuration() as unknown as {
+      hooks?: { preEgressFailClosed?: boolean };
+      auth?: { dashboardSessionTtlMs?: number; dashboardSessionCookieSecure?: boolean };
+    };
+    expect(cfg.hooks?.preEgressFailClosed).toBe(false);
+    expect(cfg.auth?.dashboardSessionTtlMs).toBe(43_200_000);
+    expect(cfg.auth?.dashboardSessionCookieSecure).toBeUndefined();
+  });
+
+  it('reflects explicit pre-egress hook and browser session overrides', () => {
+    process.env.HOOK_PRE_EGRESS_FAIL_CLOSED = 'true';
+    process.env.DASHBOARD_SESSION_TTL_MS = '3600000';
+    process.env.DASHBOARD_SESSION_COOKIE_SECURE = 'true';
+
+    const cfg = configuration() as unknown as {
+      hooks?: { preEgressFailClosed?: boolean };
+      auth?: { dashboardSessionTtlMs?: number; dashboardSessionCookieSecure?: boolean };
+    };
+    expect(cfg.hooks?.preEgressFailClosed).toBe(true);
+    expect(cfg.auth?.dashboardSessionTtlMs).toBe(3_600_000);
+    expect(cfg.auth?.dashboardSessionCookieSecure).toBe(true);
+
+    process.env.DASHBOARD_SESSION_COOKIE_SECURE = 'false';
+    const insecureCfg = configuration() as unknown as {
+      auth?: { dashboardSessionCookieSecure?: boolean };
+    };
+    expect(insecureCfg.auth?.dashboardSessionCookieSecure).toBe(false);
+
+    process.env.DASHBOARD_SESSION_COOKIE_SECURE = ' true ';
+    expect(configuration().auth.dashboardSessionCookieSecure).toBe(true);
+    process.env.DASHBOARD_SESSION_COOKIE_SECURE = ' false ';
+    expect(configuration().auth.dashboardSessionCookieSecure).toBe(false);
+  });
+});
+
+describe('configuration session proxy secret', () => {
+  const orig = process.env.SESSION_PROXY_SECRET;
+
+  afterEach(() => {
+    if (orig === undefined) delete process.env.SESSION_PROXY_SECRET;
+    else process.env.SESSION_PROXY_SECRET = orig;
+  });
+
+  it('defaults session.proxySecret to empty string when unset or blank', () => {
+    delete process.env.SESSION_PROXY_SECRET;
+    expect(configuration().session.proxySecret).toBe('');
+    process.env.SESSION_PROXY_SECRET = '   ';
+    expect(configuration().session.proxySecret).toBe('');
+  });
+
+  it('reads and trims SESSION_PROXY_SECRET into session.proxySecret', () => {
+    process.env.SESSION_PROXY_SECRET = '  inter-node-hmac-secret-0123456789  ';
+    expect(configuration().session.proxySecret).toBe('inter-node-hmac-secret-0123456789');
   });
 });

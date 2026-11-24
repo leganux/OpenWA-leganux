@@ -1,6 +1,7 @@
+import { DECORATORS } from '@nestjs/swagger';
 import { plainToInstance } from 'class-transformer';
 import { validate, ValidationError } from 'class-validator';
-import { CreateWebhookDto, UpdateWebhookDto } from './webhook.dto';
+import { CreateWebhookDto, RedriveWebhookDeliveriesDto, UpdateWebhookDto } from './webhook.dto';
 
 /** Regression locks: webhook `events[]` must be constrained to known types + '*'. */
 function errorsFor<T extends object>(cls: new () => T, obj: object): Promise<ValidationError[]> {
@@ -51,6 +52,19 @@ describe('webhook DTO event validation', () => {
   it('UpdateWebhookDto: still accepts an omitted field and a null filters (nullable column)', async () => {
     expect(await errorsFor(UpdateWebhookDto, {})).toHaveLength(0);
     expect(await errorsFor(UpdateWebhookDto, { filters: null })).toHaveLength(0);
+  });
+
+  // The secret column is nullable and the service stores null for both spellings of "clear it", so both are accepted
+  // and the published text names both; a secret under the floor is still refused.
+  it('UpdateWebhookDto: clears the secret with an empty string or null, and the schema says so', async () => {
+    expect(await errorsFor(UpdateWebhookDto, { secret: '' })).toHaveLength(0);
+    expect(await errorsFor(UpdateWebhookDto, { secret: null })).toHaveLength(0);
+    expect((await errorsFor(UpdateWebhookDto, { secret: 'short' })).map(e => e.property)).toEqual(['secret']);
+
+    const meta = Reflect.getMetadata('swagger/apiModelProperties', UpdateWebhookDto.prototype, 'secret') as {
+      description?: string;
+    };
+    expect(meta.description).toContain('an empty string or null to clear it');
   });
 
   // WebhookService.update applies filters only when the field is present, so an update that omits it
@@ -215,5 +229,22 @@ describe('webhook DTO url validation', () => {
       const errs = await errorsFor(cls, { url });
       expect(errs.some(e => e.property === 'url')).toBe(true);
     }
+  });
+});
+
+// The validators cap the redrive selection; the schema has to say so, or a client generated from it
+// sends a list the server answers with a 400.
+describe('RedriveWebhookDeliveriesDto published schema', () => {
+  const published = (key: string): Record<string, unknown> | undefined =>
+    Reflect.getMetadata(DECORATORS.API_MODEL_PROPERTIES, RedriveWebhookDeliveriesDto.prototype, key) as
+      Record<string, unknown> | undefined;
+
+  it('publishes the bounds of the id list and the limit that the validators enforce', async () => {
+    expect(published('ids')).toMatchObject({ maxItems: 500, items: { type: 'string', maxLength: 128 } });
+    expect(published('limit')).toMatchObject({ minimum: 1, maximum: 500 });
+
+    const ids = Array.from({ length: 501 }, (_, i) => `id-${i}`);
+    expect((await errorsFor(RedriveWebhookDeliveriesDto, { ids })).some(e => e.property === 'ids')).toBe(true);
+    expect(await errorsFor(RedriveWebhookDeliveriesDto, { ids: ids.slice(0, 500), limit: 500 })).toHaveLength(0);
   });
 });

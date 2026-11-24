@@ -8,9 +8,10 @@
 #   - sessions/     — whatsapp-web.js LocalAuth session data
 #   - baileys/      — Baileys engine authentication state
 #   - media/        — the local media dir (STORAGE_LOCAL_PATH), archived whenever it exists. Under
-#                     STORAGE_TYPE=s3 it holds only media the app could not write to the bucket
-#                     (unreachable, or no credentials); the bucket's contents are not archived and
-#                     need a backup of their own
+#                     STORAGE_TYPE=s3 it holds media the app could not write to the bucket
+#                     (unreachable, or no credentials) and, after a move from local storage, the
+#                     old local media until docs/14 Storage Migration Step 6 cleans it up;
+#                     the bucket's contents are not archived and need a backup of their own
 #   - plugin-packages/ — installed plugin packages from PLUGINS_DIR
 #   - plugin-state/    — registry and persisted ctx.storage state under PLUGIN_STATE_DIR/plugins
 #                        (default: <data dir>/plugins)
@@ -22,14 +23,14 @@
 # Usage:
 #   ./scripts/backup.sh
 # Environment:
-#   MAIN_DATABASE_NAME  auth/audit SQLite file (default: ./data/main.sqlite)
-#   DATABASE_NAME       data-store SQLite file (default: ./data/openwa.sqlite; sqlite only)
-#                       Both resolve EXACTLY like the app: the environment first, then ./.env, then
-#                       <data dir>/.env.generated, otherwise the fixed ./data default (see
-#                       lib-env.sh). The defaults are NOT derived from OPENWA_DATA_DIR, as the app
-#                       never does that either.
-#   OPENWA_DATA_DIR   data directory for the non-DB state below (default: ./data); a ./data/...
-#                     path read from .env.generated, database paths included, is taken under it
+#   MAIN_DATABASE_NAME  auth/audit SQLite file (default: <data dir>/main.sqlite)
+#   DATABASE_NAME       data-store SQLite file (default: <data dir>/openwa.sqlite; sqlite only)
+#                       Both resolve EXACTLY like the app: the environment first (a value of only
+#                       blanks counts as unset), then ./.env, then <data dir>/.env.generated,
+#                       otherwise the app's ./data default (see lib-env.sh).
+#   OPENWA_DATA_DIR   the app's ./data directory, such as a volume's mountpoint on the host
+#                     (default: ./data); the ./data defaults, and a ./data/... path read from ./.env
+#                     or .env.generated, are taken under it
 #   BACKUP_DIR        where archives are written (default: ./backups)
 #   DATABASE_TYPE     sqlite (default) | postgres
 #   SESSION_DATA_PATH, BAILEYS_AUTH_DIR, STORAGE_LOCAL_PATH, PLUGINS_DIR
@@ -38,6 +39,12 @@
 #                     data dir)
 #   BOOTSTRAP_KEY_FILE  the plaintext admin key to archive (default: <data dir>/.api-key)
 #                     These paths resolve through the same layers as the databases.
+#   POSTGRES_SCHEMA   for postgres: a schema other than public is dumped alone (the database may hold
+#                     other applications' schemas), with the pg_trgm and unaccent extensions, and
+#                     pgcrypto when it lives in that schema (PostgreSQL 12 and older), behind a prelude
+#                     that moves an existing copy of the schema aside on load; database.schema in the
+#                     archive names it. That dump needs pg_dump 14 or newer (the image ships 17), which
+#                     the run checks first. public dumps the whole database, as before.
 #   For postgres: DATABASE_URL, or DATABASE_HOST/PORT/USERNAME/PASSWORD/NAME
 #                     DATABASE_URL is read by this script only (the app uses the DATABASE_* keys)
 #                     and wins over them when set. It is passed to pg_dump as an argument, which
@@ -49,11 +56,16 @@
 #                     Node trusts (NODE_EXTRA_CA_CERTS included), or require when the second is
 #                     false. Without node it uses sslrootcert=system, which needs libpq 16+ and a
 #                     system CA store. PGSSLMODE and PGSSLROOTCERT, when set, take precedence.
+#                     verify-full also matches the host pg_dump connects to, DATABASE_URL's
+#                     included, against the certificate, so name the host the certificate carries.
 #
 # Failure policy: a missing source database is FATAL (no silent empty backup), and the finished
-# archive must contain every configured database or it is deleted and the run fails. When the
-# sqlite3 CLI is unavailable the databases are plain-copied (possibly torn if the app is live) and
-# the archive carries a CONSISTENCY-WARNING marker that restore.sh surfaces.
+# archive must contain every configured database or it is deleted and the run fails. The archive
+# takes its final name only once complete, so a failed tar leaves no truncated
+# openwa-backup-*.tar.gz. When the sqlite3 CLI is unavailable, backup refuses any database carrying
+# a non-empty -wal sidecar (uncheckpointed WAL data); otherwise the databases are plain-copied
+# (possibly torn if the app is live) and the archive carries a CONSISTENCY-WARNING marker that
+# restore.sh surfaces.
 #
 # Engine authentication state (sessions/, baileys/) is copied, not snapshotted: the engines rewrite
 # it while they run, so an online backup can hold a copy torn mid-write. When a whatsapp-web.js
@@ -77,14 +89,14 @@ DATABASE_TYPE="$(openwa_resolve DATABASE_TYPE sqlite)"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 
 # Database paths resolve exactly like the app: an explicit environment value wins, then ./.env, then
-# the dashboard's <data dir>/.env.generated, otherwise the fixed ./data default. OPENWA_DATA_DIR
-# bases the defaults of the non-DB state directories below and a ./data/... path from .env.generated,
-# never the database defaults: deriving those from it would back up files the app never reads.
-MAIN_DB="$(openwa_resolve MAIN_DATABASE_NAME ./data/main.sqlite path)"
+# the dashboard's <data dir>/.env.generated, otherwise the app's ./data default. That default, like
+# the state directories below, is relative to the app's working directory, so it is taken under
+# OPENWA_DATA_DIR: on the host, the cwd's ./data is not the one the app writes.
+MAIN_DB="$(openwa_resolve MAIN_DATABASE_NAME "${DATA_DIR%/}/main.sqlite" path)"
 # With DATABASE_TYPE=postgres, DATABASE_NAME names the database instead, read below only when pg_dump
 # needs it, so a line for it the scripts cannot parse stops only a backup that uses it.
 if [ "$DATABASE_TYPE" != "postgres" ]; then
-  DATA_DB="$(openwa_resolve DATABASE_NAME ./data/openwa.sqlite path)"
+  DATA_DB="$(openwa_resolve DATABASE_NAME "${DATA_DIR%/}/openwa.sqlite" path)"
 fi
 SESSIONS_DIR="$(openwa_resolve SESSION_DATA_PATH "$DATA_DIR/sessions" path)"
 BAILEYS_DIR="$(openwa_resolve BAILEYS_AUTH_DIR "$DATA_DIR/baileys" path)"
@@ -98,9 +110,10 @@ PLUGIN_PACKAGES_DIR="$(openwa_resolve PLUGINS_DIR "$DATA_DIR/plugins" path)"
 # resolved here exactly like PLUGINS_DIR above. Hardcoding $DATA_DIR/plugins meant an operator who
 # moved plugin state got an archive with neither the registry nor any plugin's storage in it, and
 # a restore that put nothing back. Resolved under its own name because the knob names the ROOT,
-# not the plugins directory inside it.
+# not the plugins directory inside it. That directory is not named PLUGIN_STATE_DIR: a variable of the
+# key's name keeps the export of a key in the environment, which restore.sh reads by name.
 PLUGIN_STATE_ROOT="$(openwa_resolve PLUGIN_STATE_DIR "$DATA_DIR" path)"
-PLUGIN_STATE_DIR="$PLUGIN_STATE_ROOT/plugins"
+PLUGIN_STATE_TARGET="$PLUGIN_STATE_ROOT/plugins"
 GENERATED_ENV="$DATA_DIR/.env.generated"
 # The app writes the generated admin key to BOOTSTRAP_KEY_FILE when that is set.
 ADMIN_KEY_FILE="$(openwa_resolve BOOTSTRAP_KEY_FILE "$DATA_DIR/.api-key" path)"
@@ -119,19 +132,24 @@ fi
 # memory limit, so an in-container run there points TMPDIR at the data volume (docs/11); staging the
 # data in the tmpfs gets the running gateway OOM-killed once the data outgrows its headroom.
 STAGE="$(mktemp -d)"
-trap 'rm -rf "$STAGE"' EXIT
+# The archive is written under a name no restore, listing or retention glob matches and renamed once the
+# min-content check passes: a tar that fails part way (the volume fills) must not leave a truncated
+# archive that reads as the newest backup.
+ARCHIVE="$BACKUP_DIR/openwa-backup-$TIMESTAMP.tar.gz"
+ARCHIVE_PARTIAL="$ARCHIVE.partial"
+trap 'rm -rf "$STAGE" "$ARCHIVE_PARTIAL"' EXIT
 
 CONSISTENCY_WARNING="$STAGE/CONSISTENCY-WARNING"
 
 # Marker file shipped INSIDE the archive so restore.sh can surface that the database snapshot was
-# plain-copied from a possibly-live app (rollback-journal mode) and may be torn.
+# plain-copied without sqlite3 .backup and may be torn if the app was live.
 record_consistency_warning() {
   if [ ! -f "$CONSISTENCY_WARNING" ]; then
     cat >"$CONSISTENCY_WARNING" <<'EOF'
 This archive was produced WITHOUT sqlite3 .backup (the sqlite3 CLI was not found on the backup
-host). The database file(s) listed below were plain-copied while the app may have been writing
-(SQLite rollback-journal mode), so the snapshot may be TORN (partially committed). Re-take the
-backup with sqlite3 installed — or with the app stopped — before relying on it for recovery.
+host). The database file(s) listed below were plain-copied while the app may have been writing,
+so the snapshot may be TORN (partially committed). Re-take the backup with sqlite3 installed, or
+with OpenWA stopped cleanly, before relying on it for recovery.
 EOF
   fi
   echo "plain-copied: $1" >>"$CONSISTENCY_WARNING"
@@ -177,6 +195,40 @@ copy_live_tree() {
   fi
 }
 
+# Resolve a SQLite database path through symlinks so backup_sqlite finds the real target's -wal
+# sidecar even when MAIN_DATABASE_NAME / DATABASE_NAME is a symlink (SQLite writes <target>-wal
+# beside the resolved file, not the link). Works even under a minimal PATH without node or readlink.
+resolve_sqlite_target() {
+  local cur="$1" dir base link hops=0
+  if command -v node >/dev/null 2>&1; then
+    node -e 'const fs = require("fs"); try { console.log(fs.realpathSync.native(process.argv[1])); } catch { console.log(process.argv[1]); }' "$cur"
+    return
+  fi
+  while [ -L "$cur" ] && [ "$hops" -lt 40 ]; do
+    dir="$(dirname "$cur")"
+    if command -v readlink >/dev/null 2>&1; then
+      link="$(readlink "$cur")"
+    else
+      # shellcheck disable=SC2012
+      link="$(LC_ALL=C ls -ld -- "$cur" | sed -n 's/.* -> //p')"
+    fi
+    [ -z "$link" ] && break
+    case "$link" in
+      /*) cur="$link" ;;
+      *) cur="$dir/$link" ;;
+    esac
+    hops=$((hops + 1))
+  done
+  dir="$(dirname "$cur")"
+  base="${cur##*/}"
+  if [ -d "$dir" ]; then
+    dir="$(cd -P "$dir" && pwd -P)"
+    printf '%s/%s\n' "${dir%/}" "$base"
+  else
+    printf '%s\n' "$cur"
+  fi
+}
+
 # Online SQLite backup (consistent without stopping the app) when sqlite3 is present. A missing
 # source database is FATAL: an archive without the configured databases is not a backup, and a
 # silent skip is how an empty archive gets reported as "Backup complete".
@@ -189,19 +241,125 @@ backup_sqlite() {
     exit 1
   fi
   if command -v sqlite3 >/dev/null 2>&1; then
-    # The app writes in rollback-journal mode, and a bare .backup gave up on the first lock it met and
-    # restarted after every outside write, so a busy gateway never got a backup. The read transaction
-    # lets the copy finish in one pass, but it blocks every app write, and with it the app's event
-    # loop, until the copy ends, and a write that outlasts the app's SQLite busy timeout fails. The
-    # busy timeout here waits out a commit, and -init /dev/null keeps the operator's sqlite3 rc file
-    # out of the run.
+    # Under the default WAL mode, the read transaction pins a consistent WAL snapshot without
+    # blocking concurrent app writers and .backup captures committed frames from -wal into a
+    # self-contained destination file. Under SQLITE_JOURNAL_MODE=DELETE (rollback-journal mode),
+    # the read transaction lets the copy finish in one pass while waiting out locks up to the
+    # 30 s busy timeout. -init /dev/null keeps the operator's sqlite3 rc file out of the run.
     sqlite3 -init /dev/null -cmd ".timeout 30000" "$src" \
       "BEGIN" "SELECT count(*) FROM sqlite_master" ".backup '$dest'" "COMMIT" >/dev/null
   else
-    log "WARN: sqlite3 not found — plain-copying live database $src (the snapshot may be torn)"
+    local wal_found="" real_src=""
+    if [ -s "$src-wal" ]; then
+      wal_found="$src-wal"
+    elif [ -L "$src" ]; then
+      real_src="$(resolve_sqlite_target "$src")"
+      if [ -n "$real_src" ] && [ -s "$real_src-wal" ]; then
+        wal_found="$real_src-wal"
+      fi
+    fi
+    if [ -n "$wal_found" ]; then
+      log "ERROR: sqlite3 CLI is not installed and $wal_found is non-empty (uncheckpointed WAL data)"
+      log "       plain-copying $src alone would silently drop committed transactions in the WAL."
+      log "       Install sqlite3 (recommended for consistent online .backup) or stop OpenWA cleanly first so the WAL is checkpointed."
+      exit 1
+    fi
+    log "WARN: sqlite3 not found; plain-copying live database $src (the snapshot may be torn)"
     cp "$src" "$dest"
     record_consistency_warning "$src"
   fi
+}
+
+# pg_schema_prelude <schema> [pgcrypto] - the SQL a schema-scoped dump starts with. Loaded into a database
+# that already holds the schema (the one the dump came from), it moves that schema aside as
+# <schema>_pre_restore_<time>, and drops pg_trgm and unaccent when they moved with it, and pgcrypto when the
+# dump carries it, with what the copy hangs on them: its trigram index on pg_trgm, and the column defaults
+# that call pgcrypto's gen_random_uuid() (PostgreSQL 12 and older). The dump can then create them in the
+# schema again, where its own defaults call them by name. Not CASCADE: extensions are per database, so an
+# object in another schema may use these, and it then fails the load, which changes nothing, rather than
+# going with them. In an empty database it does nothing. The name was checked with openwa_pg_schema_valid,
+# so it needs no quoting here.
+pg_schema_prelude() {
+  local extensions="'pg_trgm', 'unaccent'"
+  if [ -n "${2:-}" ]; then
+    extensions="$extensions, '$2'"
+  fi
+  cat <<EOF
+-- Added by backup.sh: this dump holds schema $1 only. An existing $1 is moved aside before it loads.
+DO \$openwa\$
+DECLARE
+  aside text := left('$1', 36) || '_pre_restore_' || to_char(clock_timestamp(), 'YYYYMMDDHH24MISS');
+  ext text;
+  col record;
+BEGIN
+  IF to_regnamespace('$1') IS NOT NULL THEN
+    EXECUTE format('ALTER SCHEMA %I RENAME TO %I', '$1', aside);
+    FOR ext IN SELECT extname FROM pg_extension
+      WHERE extname IN ($extensions) AND extnamespace = to_regnamespace(aside) LOOP
+      IF ext = 'pg_trgm' THEN
+        EXECUTE format('DROP INDEX IF EXISTS %I.%I', aside, 'idx_messages_body_trgm');
+      ELSIF ext = 'pgcrypto' THEN
+        FOR col IN SELECT DISTINCT c.relname, a.attname FROM pg_attrdef d
+          JOIN pg_class c ON c.oid = d.adrelid AND c.relnamespace = to_regnamespace(aside)
+          JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+          JOIN pg_depend f ON f.classid = 'pg_attrdef'::regclass AND f.objid = d.oid
+            AND f.refclassid = 'pg_proc'::regclass
+          JOIN pg_depend m ON m.classid = 'pg_proc'::regclass AND m.objid = f.refobjid AND m.deptype = 'e'
+            AND m.refclassid = 'pg_extension'::regclass
+          JOIN pg_extension e ON e.oid = m.refobjid AND e.extname = 'pgcrypto' LOOP
+          EXECUTE format('ALTER TABLE %I.%I ALTER COLUMN %I DROP DEFAULT', aside, col.relname, col.attname);
+        END LOOP;
+      END IF;
+      EXECUTE format('DROP EXTENSION %I', ext);
+    END LOOP;
+  END IF;
+END
+\$openwa\$;
+EOF
+}
+
+# pg_dump_data <connection arguments...> - the data store's dump: the whole database for the public
+# schema, else POSTGRES_SCHEMA alone (PG_DUMP_SCHEMA) behind its prelude, with the extensions the app's
+# search index uses. plpgsql always matches, so the list never fails pg_dump where the others are absent.
+# pgcrypto joins them only when it lives in that schema: on PostgreSQL 12 and older the migrations create
+# it there, and the id defaults call its gen_random_uuid() by that schema's name. From 13 the function is
+# core and the app never uses pgcrypto, so one in another schema stays out, and a load into an empty
+# database does not need that schema. A schema-only probe over the same connection reads where it lives
+# from pg_dump's CREATE EXTENSION line; a failed probe fails the backup.
+# No comments: COMMENT ON EXTENSION needs the extension's owner even where CREATE EXTENSION IF NOT EXISTS
+# skipped one that exists, and the app writes no comment of its own.
+pg_dump_data() {
+  if [ -z "$PG_DUMP_SCHEMA" ]; then
+    pg_dump "$@"
+    return
+  fi
+  # The scoped dump names its extensions with -e, which pg_dump has had since 14: an older client stops at
+  # "unrecognized option" once the dump starts, so it is refused before anything is dumped. The version is read
+  # with the dump's own arguments, which pg_dump ignores after --version: Debian's pg_wrapper picks the client by
+  # them (the newest installed for -h, the local cluster's without). stdout is the dump, so messages go to stderr.
+  local version major_re='\) ([0-9]+)'
+  version="$(pg_dump --version "$@" 2>&1 || true)"
+  if ! [[ "$version" =~ $major_re ]] || [ "${BASH_REMATCH[1]}" -lt 14 ]; then
+    log "ERROR: POSTGRES_SCHEMA=$PG_DUMP_SCHEMA is dumped with pg_dump --extension, which needs pg_dump 14 or newer" >&2
+    log "       (the image ships 17); this one reports: $version" >&2
+    exit 1
+  fi
+  local probe extensions=(-e plpgsql -e pg_trgm -e unaccent) pgcrypto=""
+  probe="$(pg_dump --schema-only -n "$PG_DUMP_SCHEMA" -e plpgsql -e pgcrypto "$@")"
+  if grep -Eqx "CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA \"?$PG_DUMP_SCHEMA\"?;" <<<"$probe"; then
+    pgcrypto=pgcrypto
+    extensions+=(-e pgcrypto)
+  fi
+  pg_schema_prelude "$PG_DUMP_SCHEMA" "$pgcrypto"
+  # The trigram index moves to the end. It is built as the table owner, its expression calls unaccent in this
+  # schema, and when another role owns the schema pg_dump grants that owner USAGE on it only in its closing ACL
+  # pass, so in pg_dump's place the index stopped every load with "permission denied for schema". pg_dump writes
+  # it on one line, the name quoted only when it is a keyword. pipefail keeps a failed pg_dump fatal.
+  pg_dump -n "$PG_DUMP_SCHEMA" --no-comments "${extensions[@]}" "$@" | awk -v s="$PG_DUMP_SCHEMA" '
+    index($0, "CREATE INDEX idx_messages_body_trgm ON " s ".messages USING gin ") == 1 ||
+      index($0, "CREATE INDEX idx_messages_body_trgm ON \"" s "\".messages USING gin ") == 1 { held = $0; next }
+    { print }
+    END { if (held != "") print held }'
 }
 
 # Members the finished archive MUST contain (relative tar paths). A run that cannot stage any of
@@ -218,19 +376,47 @@ if [ "$DATABASE_TYPE" = "postgres" ]; then
     log "ERROR: DATABASE_TYPE=postgres but pg_dump is not installed"
     exit 1
   fi
+  # The app keeps its tables, ledger and search_path in POSTGRES_SCHEMA. A schema other than public may
+  # share its database with other applications, whose schemas this role need not be able to read, so it
+  # is dumped alone, and database.schema names it for restore.sh. public keeps the whole-database dump.
+  PG_SCHEMA="$(openwa_resolve POSTGRES_SCHEMA public)"
+  PG_DUMP_SCHEMA=""
+  if [ "$PG_SCHEMA" != public ]; then
+    if ! openwa_pg_schema_valid "$PG_SCHEMA"; then
+      log "ERROR: POSTGRES_SCHEMA=$PG_SCHEMA is not a schema name the app accepts: a lower-case letter or underscore,"
+      log "       then lower-case letters, digits or underscores, at most 63 characters, not starting with pg_"
+      exit 1
+    fi
+    PG_DUMP_SCHEMA="$PG_SCHEMA"
+  fi
   # libpq defaults to sslmode=prefer, which falls back to plaintext and accepts any certificate, so
   # the dump sent the database password past the TLS check the app makes. Apply the app's check:
   # verify the server against the CA roots Node trusts (the image has no system CA store), or only
   # encrypt when DATABASE_SSL_REJECT_UNAUTHORIZED=false. An operator's PGSSLMODE or PGSSLROOTCERT wins.
-  if [ "$(openwa_resolve DATABASE_SSL false)" = true ] && [ -z "${PGSSLMODE:-}" ]; then
-    if [ "$(openwa_resolve DATABASE_SSL_REJECT_UNAUTHORIZED true)" = false ]; then
+  # Each key is resolved on its own line, where set -e stops the run on a line the scripts cannot
+  # parse; inside a `[` test that failure would be ignored and pg_dump would connect as if the line
+  # were absent.
+  PG_SSL=false
+  if [ -z "${PGSSLMODE:-}" ]; then
+    PG_SSL="$(openwa_resolve DATABASE_SSL false)"
+  fi
+  if [ "$PG_SSL" = true ]; then
+    PG_SSL_REJECT="$(openwa_resolve DATABASE_SSL_REJECT_UNAUTHORIZED true)"
+    if [ "$PG_SSL_REJECT" = false ]; then
       export PGSSLMODE=require
     else
       if [ -z "${PGSSLROOTCERT:-}" ] && command -v node >/dev/null 2>&1; then
         PG_ROOT_CERTS="$(mktemp)"
-        trap 'rm -rf "$STAGE" "$PG_ROOT_CERTS"' EXIT
+        trap 'rm -rf "$STAGE" "$ARCHIVE_PARTIAL" "$PG_ROOT_CERTS"' EXIT
+        # Before Node 22.15 there is no getCACertificates, and rootCertificates holds only the bundled
+        # roots, so NODE_EXTRA_CA_CERTS is added from its file. An unreadable file is skipped, as Node
+        # itself skips it after the warning it prints at startup.
         node -e 'const tls = require("tls");
-          console.log((tls.getCACertificates ? tls.getCACertificates("default") : tls.rootCertificates).join("\n"))' \
+          let certs = tls.getCACertificates ? tls.getCACertificates("default") : tls.rootCertificates;
+          if (!tls.getCACertificates && process.env.NODE_EXTRA_CA_CERTS) {
+            try { certs = certs.concat(require("fs").readFileSync(process.env.NODE_EXTRA_CA_CERTS, "utf8")); } catch {}
+          }
+          console.log(certs.join("\n"))' \
           >"$PG_ROOT_CERTS"
       elif [ -z "${PGSSLROOTCERT:-}" ]; then
         log "node not found: verifying the server against the system CA store (sslrootcert=system," \
@@ -241,7 +427,7 @@ if [ "$DATABASE_TYPE" = "postgres" ]; then
   fi
   DATABASE_URL_RESOLVED="$(openwa_resolve DATABASE_URL '')"
   if [ -n "$DATABASE_URL_RESOLVED" ]; then
-    pg_dump "$DATABASE_URL_RESOLVED" >"$STAGE/database.sql"
+    pg_dump_data "$DATABASE_URL_RESOLVED" >"$STAGE/database.sql"
   else
     # Same layered resolution as the paths above: a dashboard-provisioned Postgres keeps its
     # connection details in <data dir>/.env.generated, never in the operator's shell. Each is
@@ -252,9 +438,13 @@ if [ "$DATABASE_TYPE" = "postgres" ]; then
     PG_PORT="$(openwa_resolve DATABASE_PORT 5432)"
     PG_USER="$(openwa_resolve DATABASE_USERNAME openwa)"
     PG_NAME="$(openwa_resolve DATABASE_NAME openwa)"
-    PGPASSWORD="$PG_PASSWORD" pg_dump -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" "$PG_NAME" >"$STAGE/database.sql"
+    PGPASSWORD="$PG_PASSWORD" pg_dump_data -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" "$PG_NAME" >"$STAGE/database.sql"
   fi
   REQUIRED_MEMBERS+=("./database.sql")
+  if [ -n "$PG_DUMP_SCHEMA" ]; then
+    printf '%s\n' "$PG_DUMP_SCHEMA" >"$STAGE/database.schema"
+    REQUIRED_MEMBERS+=("./database.schema")
+  fi
 else
   log "Backing up data store ($DATA_DB)"
   backup_sqlite "$DATA_DB" "$STAGE/openwa.sqlite"
@@ -287,8 +477,11 @@ if [ -d "$BAILEYS_DIR" ]; then
   if [ -n "$(find -H "$BAILEYS_DIR" -mindepth 1 -maxdepth 1 -type d -print -quit)" ]; then
     record_engine_state_note "baileys/ (recorded whenever Baileys state exists; it cannot show whether it was live)"
   fi
-# The warning is advisory, so an ENGINE_TYPE line the scripts cannot parse skips it instead of the backup.
-elif ! ENGINE_TYPE_RESOLVED="$(openwa_resolve ENGINE_TYPE '')"; then
+# The warning is advisory, so an ENGINE_TYPE line the scripts cannot parse skips it instead of the backup,
+# and its error is reported as a warning. A failed lookup prints nothing on stdout and a successful one
+# nothing on stderr, so both share the substitution.
+elif ! ENGINE_TYPE_RESOLVED="$(openwa_resolve ENGINE_TYPE '' 2>&1)"; then
+  sed -e 's/^\[config\] ERROR: /[config] WARN: /' -e 's/^\[config\]        /[config]       /' <<<"$ENGINE_TYPE_RESOLVED" >&2
   log "WARN: ENGINE_TYPE could not be read (see above); skipping only the check for missing Baileys state"
 elif [ "$ENGINE_TYPE_RESOLVED" = "baileys" ]; then
   log "WARN: ENGINE_TYPE=baileys but $BAILEYS_DIR was not found — restored sessions will require pairing"
@@ -314,9 +507,9 @@ if [ -z "$(openwa_resolve PLUGINS_DIR '')" ] &&
   log "      move them into $PLUGIN_PACKAGES_DIR, or set PLUGINS_DIR=./plugins, and back up again"
 fi
 
-if [ -d "$PLUGIN_STATE_DIR" ]; then
+if [ -d "$PLUGIN_STATE_TARGET" ]; then
   log "Backing up plugin registry and persisted state"
-  copy_live_tree "$PLUGIN_STATE_DIR" "$STAGE/plugin-state"
+  copy_live_tree "$PLUGIN_STATE_TARGET" "$STAGE/plugin-state"
 fi
 
 if [ -f "$GENERATED_ENV" ]; then
@@ -329,10 +522,9 @@ if [ -f "$ADMIN_KEY_FILE" ]; then
   cp -p "$ADMIN_KEY_FILE" "$STAGE/.api-key"
 fi
 
-ARCHIVE="$BACKUP_DIR/openwa-backup-$TIMESTAMP.tar.gz"
-tar -czf "$ARCHIVE" -C "$STAGE" .
+tar -czf "$ARCHIVE_PARTIAL" -C "$STAGE" .
 
-ARCHIVE_LIST="$(tar -tzf "$ARCHIVE")"
+ARCHIVE_LIST="$(tar -tzf "$ARCHIVE_PARTIAL")"
 
 # Min-content check on the finished archive: every configured database must be present. If not,
 # delete the defective archive and fail — leaving it on disk invites a restore into a fresh-empty
@@ -347,9 +539,10 @@ for member in "${REQUIRED_MEMBERS[@]}"; do
 done
 if [ -n "$MISSING_MEMBERS" ]; then
   log "ERROR: archive failed the min-content check — missing required member(s):$MISSING_MEMBERS"
-  rm -f "$ARCHIVE"
+  rm -f "$ARCHIVE_PARTIAL"
   exit 1
 fi
+mv "$ARCHIVE_PARTIAL" "$ARCHIVE"
 
 log "Backup complete: $ARCHIVE"
 log "SECURITY: this archive can contain database passwords, plugin secrets, and an admin API key; restrict and encrypt it"

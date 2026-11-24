@@ -6,6 +6,7 @@ import {
 } from './ingress-enqueue.service';
 import { PluginLoaderService } from '../../core/plugins/plugin-loader.service';
 import { ConfigService } from '@nestjs/config';
+import { producerConnectWaitMs } from '../queue/redis-connection';
 
 describe('IngressEnqueueService', () => {
   const data = {
@@ -19,12 +20,12 @@ describe('IngressEnqueueService', () => {
 
   let loader: jest.Mocked<Partial<PluginLoaderService>>;
   let config: jest.Mocked<Partial<ConfigService>>;
-  let queue: { add: jest.Mock };
+  let queue: { add: jest.Mock; waitUntilReady: jest.Mock };
 
   beforeEach(() => {
     loader = { dispatchWebhookForInstance: jest.fn().mockResolvedValue(undefined) };
     config = { get: jest.fn() };
-    queue = { add: jest.fn().mockResolvedValue(undefined) };
+    queue = { add: jest.fn().mockResolvedValue(undefined), waitUntilReady: jest.fn().mockResolvedValue(undefined) };
   });
 
   it('adds a job to the ingress queue keyed by the namespaced jobId when queueing is enabled and a queue is present', async () => {
@@ -58,9 +59,9 @@ describe('IngressEnqueueService', () => {
       expect(getJobState).toHaveBeenCalledWith(sanitizeIngressJobId('d1', 'chatwoot\u0000acct1'));
     });
 
-    it('reports no job when the queue holds none, is off, or cannot answer', async () => {
+    it('reports no job when the queue holds none or is off', async () => {
       (config.get as jest.Mock).mockReturnValue(true);
-      const getJobState = jest.fn().mockResolvedValueOnce('unknown').mockRejectedValueOnce(new Error('ECONNREFUSED'));
+      const getJobState = jest.fn().mockResolvedValueOnce('unknown');
       const svc = new IngressEnqueueService(
         loader as PluginLoaderService,
         config as ConfigService,
@@ -70,12 +71,25 @@ describe('IngressEnqueueService', () => {
         } as never,
       );
       expect(await svc.existingJobState(data, 'd1')).toBeUndefined();
-      expect(await svc.existingJobState(data, 'd1')).toBeUndefined();
 
       getJobState.mockClear();
       (config.get as jest.Mock).mockReturnValue(false);
       expect(await svc.existingJobState(data, 'd1')).toBeUndefined();
       expect(getJobState).not.toHaveBeenCalled();
+    });
+
+    // A queue that cannot be asked may well hold the job, so the answer says so instead of reading as none: a caller
+    // that took it for none would replay the delivery inline beside a job that is alive in Redis.
+    it('reports the queue unreachable, not empty, when it cannot answer', async () => {
+      (config.get as jest.Mock).mockReturnValue(true);
+      const getJobState = jest.fn().mockRejectedValue(new Error('ECONNREFUSED'));
+      const svc = new IngressEnqueueService(
+        loader as PluginLoaderService,
+        config as ConfigService,
+        { ...queue, getJobState } as never,
+      );
+
+      expect(await svc.existingJobState(data, 'd1')).toBe('unreachable');
     });
 
     // IngressProcessor re-queues a delivery whose dead-letter write failed under a copy id: that copy
@@ -189,6 +203,47 @@ describe('IngressEnqueueService', () => {
     expect(loader.dispatchWebhookForInstance).toHaveBeenCalledWith(data);
   });
 
+  // A plugin the boot restore has not reached has no worker. With the queue on, the job waits in the queue and
+  // IngressProcessor holds it; dispatching inline is the one path that would have to run the plugin right away.
+  describe('defersInlineDispatch', () => {
+    const restoring = (ids: string[]) => {
+      loader.isRestorePending = jest.fn((id: string) => ids.includes(id));
+    };
+
+    it('defers a plugin the restore has not reached while dispatch is inline', () => {
+      restoring(['chatwoot']);
+      (config.get as jest.Mock).mockReturnValue(false);
+      const svc = new IngressEnqueueService(loader as PluginLoaderService, config as ConfigService, queue as never);
+
+      expect(svc.defersInlineDispatch('chatwoot')).toBe(true);
+      expect(svc.defersInlineDispatch('other')).toBe(false);
+    });
+
+    it('also defers when the queue is switched on but no queue instance was injected', () => {
+      restoring(['chatwoot']);
+      (config.get as jest.Mock).mockReturnValue(true);
+      const svc = new IngressEnqueueService(loader as PluginLoaderService, config as ConfigService, undefined);
+
+      expect(svc.defersInlineDispatch('chatwoot')).toBe(true);
+    });
+
+    it('does not defer when a queue takes the job', () => {
+      restoring(['chatwoot']);
+      (config.get as jest.Mock).mockReturnValue(true);
+      const svc = new IngressEnqueueService(loader as PluginLoaderService, config as ConfigService, queue as never);
+
+      expect(svc.defersInlineDispatch('chatwoot')).toBe(false);
+    });
+
+    it('does not defer once the restore is done with the plugin', () => {
+      restoring([]);
+      (config.get as jest.Mock).mockReturnValue(false);
+      const svc = new IngressEnqueueService(loader as PluginLoaderService, config as ConfigService, queue as never);
+
+      expect(svc.defersInlineDispatch('chatwoot')).toBe(false);
+    });
+  });
+
   describe('onApplicationBootstrap (queue-wiring tripwire)', () => {
     const ORIGINAL = process.env.QUEUE_ENABLED;
 
@@ -246,6 +301,37 @@ describe('IngressEnqueueService', () => {
       attempts: 3,
       backoff: { type: 'exponential', delay: 5000 },
     });
+    expect(loader.dispatchWebhookForInstance).toHaveBeenCalledWith(data);
+  });
+
+  // Until the first connect, BullMQ holds every queue call without sending a command and retries the
+  // connection for ever, so enableOfflineQueue:false never rejects: with Redis unreachable since boot,
+  // the ingress request, a redrive and the reconciler's row in hand would wait indefinitely.
+  it('falls back to inline dispatch and reports the queue unreachable when Redis has not connected within the connect timeout', async () => {
+    (config.get as jest.Mock).mockReturnValue(true);
+    const pending = () => new Promise<never>(() => {});
+    queue.waitUntilReady.mockImplementation(pending);
+    queue.add.mockImplementation(pending);
+    const getJobState = jest.fn(pending);
+    const svc = new IngressEnqueueService(
+      loader as PluginLoaderService,
+      config as ConfigService,
+      { ...queue, getJobState } as never,
+    );
+    let results: unknown;
+    jest.useFakeTimers();
+    try {
+      void Promise.all([svc.existingJobState(data, 'd1'), svc.enqueue(data, 'd1')]).then(r => (results = r));
+      await jest.advanceTimersByTimeAsync(producerConnectWaitMs() - 1);
+      expect(results).toBeUndefined();
+      await jest.advanceTimersByTimeAsync(1);
+    } finally {
+      jest.useRealTimers();
+    }
+
+    expect(results).toEqual(['unreachable', { outcome: 'dispatched' }]);
+    expect(getJobState).not.toHaveBeenCalled();
+    expect(queue.add).not.toHaveBeenCalled();
     expect(loader.dispatchWebhookForInstance).toHaveBeenCalledWith(data);
   });
 

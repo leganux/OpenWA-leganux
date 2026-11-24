@@ -7,16 +7,18 @@ import { PluginLoaderService } from '../../core/plugins/plugin-loader.service';
 import { IngressJobData } from '../queue/processors/ingress.processor';
 import { IntegrationDeliveryFailure } from './entities/integration-delivery-failure.entity';
 import { QUEUE_NAMES } from '../queue/queue-names';
+import { producerReady } from '../queue/redis-connection';
 import { createLogger } from '../../common/services/logger.service';
 import { resolveNonNegativeIntEnv } from '../../config/configuration';
 
 /**
  * Outcome of an enqueue attempt. 'queued' = handed to BullMQ; 'dispatched' = delivered inline; 'failed'
- * = inline dispatch threw and was swallowed (`error` carries the message). enqueue() never throws, so
- * callers use the outcome (not exceptions) to decide durability follow-up: a LIVE ingress delivery must
- * persist a dead-letter row on 'failed' (see buildIngressDeadLetterRow, wired at the IngressService
- * factory) so RedriveService can replay it; RedriveService itself calls enqueue() directly, because a
- * failed replay must keep its EXISTING dead-letter row redrivable rather than write a second one.
+ * = inline dispatch threw and was swallowed (`error` carries the message). enqueue() does not throw
+ * (bar an aborted `signal`, see enqueue), so callers use the outcome (not exceptions) to decide
+ * durability follow-up: a LIVE ingress delivery must persist a dead-letter row on 'failed' (see
+ * buildIngressDeadLetterRow, wired at the IngressService factory) so RedriveService can replay it;
+ * RedriveService itself calls enqueue() directly, because a failed replay must keep its EXISTING
+ * dead-letter row redrivable rather than write a second one.
  */
 export type EnqueueOutcome = { outcome: 'queued' | 'dispatched' | 'failed'; error?: string };
 
@@ -137,16 +139,32 @@ export class IngressEnqueueService implements OnApplicationBootstrap {
   }
 
   /**
-   * State of the job an earlier enqueue() of this delivery left in the queue, or undefined when the
-   * queue is off, holds no such job, or cannot answer. add() resolves for a duplicate jobId whatever
-   * state the existing job is in, so a caller replaying under the original jobId must look first: a
+   * Whether a delivery of this plugin must wait to be dispatched: it would run inline, because the queue is off,
+   * in a plugin the boot restore has not reached, which has no worker to run it in. With the queue on, the job
+   * is enqueued instead, and IngressProcessor holds it until the plugin is up.
+   */
+  defersInlineDispatch(pluginId: string): boolean {
+    return !this.isQueueActive() && this.loader.isRestorePending(pluginId);
+  }
+
+  /** Whether deliveries go through the queue, so that the state of a delivery's job says something about it. */
+  isQueueActive(): boolean {
+    return this.config.get<boolean>('queue.enabled', false) && !!this.ingressQueue;
+  }
+
+  /**
+   * State of the job an earlier enqueue() of this delivery left in the queue, undefined when the queue is
+   * off or holds no such job, and 'unreachable' when it could not be asked (Redis down or not yet connected):
+   * the job may well exist, so a caller must not treat that as none. add() resolves for a duplicate jobId
+   * whatever state the existing job is in, so a caller replaying under the original jobId must look first: a
    * retained failed job (removeOnFail keeps it for a day) would silently swallow the replay. When that
    * job failed or is gone, a live or completed re-queued copy (see requeuedJobIds) answers for it: the
    * copy owns the delivery, so neither a replay nor a dead-letter row may stand in for it.
    */
-  async existingJobState(data: IngressJobData, jobId: string): Promise<JobState | undefined> {
+  async existingJobState(data: IngressJobData, jobId: string): Promise<JobState | 'unreachable' | undefined> {
     if (!this.config.get<boolean>('queue.enabled', false) || !this.ingressQueue) return undefined;
     try {
+      await producerReady(this.ingressQueue);
       const id = queueJobId(data, jobId);
       const state = await this.ingressQueue.getJobState(id);
       if (isLiveOrCompleted(state)) return state;
@@ -156,7 +174,8 @@ export class IngressEnqueueService implements OnApplicationBootstrap {
       }
       return state === 'unknown' ? undefined : state;
     } catch (err) {
-      // Redis unreachable: enqueue() then takes its own inline fallback, as it would without the probe.
+      // Redis unreachable or not yet connected. Said as such, because enqueue() would take its inline
+      // fallback and dispatch a delivery whose job is still in Redis.
       this.logger.warn('Ingress job state lookup failed', {
         pluginId: data.pluginId,
         instanceId: data.instanceId,
@@ -164,11 +183,16 @@ export class IngressEnqueueService implements OnApplicationBootstrap {
         error: err instanceof Error ? err.message : String(err),
         action: 'ingress_job_state_lookup_failed',
       });
-      return undefined;
+      return 'unreachable';
     }
   }
 
-  async enqueue(data: IngressJobData, jobId: string): Promise<EnqueueOutcome> {
+  /**
+   * `signal` lets a caller that stops at shutdown (the reconciler) refuse the inline fallback once it
+   * has aborted: a queue add that fails after the stop rethrows the abort reason instead of
+   * dispatching, since the plugin may already be torn down. That is the only way enqueue() throws.
+   */
+  async enqueue(data: IngressJobData, jobId: string, signal?: AbortSignal): Promise<EnqueueOutcome> {
     const queueEnabled = this.config.get<boolean>('queue.enabled', false);
     const useQueue = queueEnabled && !!this.ingressQueue;
 
@@ -178,6 +202,7 @@ export class IngressEnqueueService implements OnApplicationBootstrap {
         // exponential-backoff attempts so a transient failure retries before landing in the DLQ. The id
         // is sanitized because BullMQ refuses several id shapes at add() (see sanitizeIngressJobId),
         // which would otherwise read as a Redis failure here and fall through to inline dispatch.
+        await producerReady(this.ingressQueue);
         await this.ingressQueue.add('ingress', data, {
           jobId: queueJobId(data, jobId),
           ...resolveIngressJobOptions(),
@@ -185,9 +210,11 @@ export class IngressEnqueueService implements OnApplicationBootstrap {
         return { outcome: 'queued' };
       } catch (err) {
         // Redis unreachable (enableOfflineQueue:false makes add() reject) — fall through to inline
-        // dispatch. Without this, the already-persisted event would be lost forever: the throw would
-        // 500 the ingress request, the provider retries, dedup returns "duplicate", and no job was
-        // ever enqueued (no DLQ row either). Mirrors WebhookService's queue-add fallback.
+        // dispatch (before the first connect, producerReady rejects instead). Without this, the
+        // already-persisted event would be lost forever: the throw would 500 the ingress request, the
+        // provider retries, dedup returns "duplicate", and no job was ever enqueued (no DLQ row either).
+        // Mirrors WebhookService's queue-add fallback.
+        signal?.throwIfAborted();
         this.logger.error(
           'Ingress queue add failed; dispatching inline',
           err instanceof Error ? err.message : String(err),

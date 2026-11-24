@@ -1,5 +1,6 @@
-import type { IncomingMessage } from '../interfaces/whatsapp-engine.interface';
+import type { InboundTicket, IncomingMessage } from '../interfaces/whatsapp-engine.interface';
 import { ConcurrencyLimiter } from '../../common/utils/concurrency-limiter';
+import { computeFeatureFlags } from '../../config/feature-flags';
 
 /** Default inbound media cap: 50 MiB. Shares MEDIA_DOWNLOAD_MAX_BYTES with the outbound download cap. */
 const DEFAULT_INBOUND_MEDIA_MAX_BYTES = 50 * 1024 * 1024;
@@ -83,10 +84,10 @@ export function inboundMediaTimeoutMs(): number {
  * bound TIME: a remote sender can trickle bytes slowly (never tripping the cap) and hold a concurrency
  * slot indefinitely — a slow-loris on the inbound pipeline. On timeout `onTimeout` runs — a best-effort
  * hook to abort the source where it's abortable (e.g. destroy a Baileys stream) — and the result resolves
- * `null`, the "no usable media" sentinel. A non-abortable source (the wwjs `downloadMedia()`) can't be
- * stopped, so that caller must instead hold its concurrency slot until the real download settles. A late
- * rejection from the abandoned download is swallowed so it can't surface as an unhandled rejection after
- * the race has already settled.
+ * `null`, the "no usable media" sentinel. A non-abortable source (the wwjs page download,
+ * `downloadCappedMedia()`) can't be stopped, so that caller must instead hold its concurrency slot until the
+ * real download settles. A late rejection from the abandoned download is swallowed so it can't surface as an
+ * unhandled rejection after the race has already settled.
  */
 export function withInboundDownloadTimeout<T>(
   promise: Promise<T>,
@@ -116,6 +117,31 @@ export function withInboundDownloadTimeout<T>(
 export function isMediaDownloadEnabled(): boolean {
   const val = (process.env.MEDIA_DOWNLOAD_ENABLED ?? '').trim().toLowerCase();
   return val !== 'false' && val !== '0' && val !== 'no';
+}
+
+/**
+ * Whether an incoming message of a disappearing-messages chat is kept. STORE_EPHEMERAL_MESSAGES=false opts out: the
+ * session neither stores nor dispatches such a message, so the engine keeps no copy of its content either. Read from
+ * the flag set the session's boot snapshot is built from, at call time, so the two cannot disagree.
+ */
+export function isEphemeralStorageEnabled(): boolean {
+  return computeFeatureFlags().storeEphemeralMessages;
+}
+
+/**
+ * Whether the session drops a message it received: STORE_EPHEMERAL_MESSAGES=false and a chat with a disappearing-messages
+ * timer. What the account sent, here or from its phone, is announced and can be changed, and a status is the status
+ * store's, so those are not dropped. The engine keeps no copy of a dropped message and no text of it as a chat preview.
+ */
+export function isDroppedEphemeral(
+  message: Pick<IncomingMessage, 'ephemeralDuration' | 'fromMe' | 'isStatusBroadcast'>,
+): boolean {
+  return (
+    !isEphemeralStorageEnabled() &&
+    (message.ephemeralDuration ?? 0) > 0 &&
+    !message.fromMe &&
+    !message.isStatusBroadcast
+  );
 }
 
 /**
@@ -196,4 +222,28 @@ export function capInboundMedia(args: {
     return { mimetype: args.mimetype, filename: args.filename, omitted: true, sizeBytes: args.sizeBytes };
   }
   return { mimetype: args.mimetype, filename: args.filename, data: args.toBase64() };
+}
+
+const NO_ROOM: InboundTicket = {
+  reserve: () => false,
+  holdUntil: () => undefined,
+  drop: () => undefined,
+  revoked: false,
+};
+
+/**
+ * Admit a live message (EngineEventCallbacks.admitInbound) without letting a throw escape the event
+ * handler. A message whose admission failed still goes out, but holds no room, so its media takes the
+ * omitted marker instead of a download nothing bounds.
+ */
+export function admitInboundSafely(
+  admit: () => InboundTicket | undefined,
+  onError: (error: unknown) => void,
+): InboundTicket | undefined {
+  try {
+    return admit();
+  } catch (error) {
+    onError(error);
+    return NO_ROOM;
+  }
 }

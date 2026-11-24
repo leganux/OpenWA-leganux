@@ -1,5 +1,9 @@
 import 'reflect-metadata';
-import { DataSource } from 'typeorm';
+import { NotImplementedException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import type { HttpAdapterHost } from '@nestjs/core';
+import { Subject } from 'rxjs';
+import { DataSource, type QueryDeepPartialEntity } from 'typeorm';
 import { Message, MessageDirection } from '../../../modules/message/entities/message.entity';
 import { Session } from '../../../modules/session/entities/session.entity';
 import { BuiltInFtsProvider } from './builtin-fts.provider';
@@ -125,6 +129,83 @@ describe('BuiltInFtsProvider (sqlite)', () => {
     expect(page.total).toBe(1);
   });
 
+  describe('chat and sender filters expanded by the host', () => {
+    // One person, three stored forms: the same chat was first stored under a lid, later under each phone
+    // dialect, and a group message keeps the group in `from` and the person in `author`.
+    beforeEach(async () => {
+      const insert = (row: QueryDeepPartialEntity<Message>): Promise<unknown> =>
+        ds.getRepository(Message).insert({
+          sessionId: 's1',
+          to: 'me@c.us',
+          type: 'text',
+          direction: MessageDirection.INCOMING,
+          timestamp: 10,
+          ...row,
+        });
+      await insert({ chatId: '628123@c.us', from: '628123@c.us', body: 'invoice via phone' });
+      await insert({
+        chatId: '628123@s.whatsapp.net',
+        from: '628123@s.whatsapp.net',
+        body: 'invoice via other dialect',
+      });
+      await insert({ chatId: '999@lid', from: '999@lid', body: 'invoice via lid' });
+      await insert({ chatId: '120363@g.us', from: '120363@g.us', author: '628123@c.us', body: 'invoice in a group' });
+      await insert({ chatId: '628555@c.us', from: '628555@c.us', body: 'invoice from someone else' });
+    });
+
+    const bodies = async (filter: Omit<SearchQuery, 'q'>): Promise<string[]> =>
+      (await provider.search({ q: 'invoice', ...filter })).hits.map(h => h.body).sort();
+
+    it('finds a chat under every stored form of its id', async () => {
+      const chatIdAliases = ['628123@c.us', '628123@s.whatsapp.net', '999@lid'];
+
+      expect(await bodies({ chatId: '628123@c.us' })).toEqual(['invoice via phone']);
+      expect(await bodies({ chatId: '628123@c.us', chatIdAliases })).toEqual([
+        'invoice via lid',
+        'invoice via other dialect',
+        'invoice via phone',
+      ]);
+    });
+
+    it('matches a sender by its from column or, in a group, by its author', async () => {
+      const fromAliases = ['628123@c.us', '628123@s.whatsapp.net', '999@lid'];
+
+      expect(await bodies({ from: '628123@c.us', fromAliases })).toEqual([
+        'invoice in a group',
+        'invoice via lid',
+        'invoice via other dialect',
+        'invoice via phone',
+      ]);
+    });
+
+    it('still honours the key allowlist beside an expanded chat filter, in the page and in the total', async () => {
+      const res = await provider.search({
+        q: 'invoice',
+        chatId: '628123@c.us',
+        chatIdAliases: ['628123@c.us', '628123@s.whatsapp.net', '999@lid'],
+        chatIds: ['628123@s.whatsapp.net'],
+        limit: 1,
+        offset: 0,
+      });
+
+      expect(res.hits.map(h => h.body)).toEqual(['invoice via other dialect']);
+      expect(res.total).toBe(1);
+    });
+
+    it('counts the expanded filters too', async () => {
+      const page = await provider.search({
+        q: 'invoice',
+        from: '628123@c.us',
+        fromAliases: ['628123@c.us', '628123@s.whatsapp.net', '999@lid'],
+        limit: 1,
+        offset: 1,
+      });
+
+      expect(page.hits).toHaveLength(1);
+      expect(page.total).toBe(4);
+    });
+  });
+
   it('scopes by sessionIds (auth) and by sessionId filter', async () => {
     const scoped = await provider.search({ q: 'hello', sessionIds: ['s1'] });
     expect(scoped.hits.every(h => h.sessionId === 's1')).toBe(true);
@@ -162,6 +243,47 @@ describe('BuiltInFtsProvider (sqlite)', () => {
     expect((await provider.search({ q: 'hello', chatIds: ['c2'], sessionIds: ['s1'] })).total).toBe(0);
   });
 
+  // The documented direction of the match=word score on SQLite: FTS5's bm25 rank, negative, lower for the
+  // more relevant hit, which comes first. PostgreSQL's ts_rank runs the other way.
+  it('reports the word score as the FTS5 rank: negative, lowest for the most relevant hit', async () => {
+    await ds.getRepository(Message).insert({
+      sessionId: 's1',
+      chatId: 'c1',
+      from: 'a@c.us',
+      to: 'dest@c.us',
+      body: 'hello hello hello',
+      type: 'text',
+      direction: MessageDirection.OUTGOING,
+      timestamp: 1,
+    });
+
+    const { hits } = await provider.search({ q: 'hello' });
+    const scores = hits.map(hit => hit.score as number);
+    expect(hits[0].body).toBe('hello hello hello');
+    expect(scores.every(score => score < 0)).toBe(true);
+    expect([...scores].sort((a, b) => a - b)).toEqual(scores);
+  });
+
+  // bm25 weighs a term by how many messages the whole index holds, so the rank of a hit a session- or
+  // chat-scoped caller may read still reflects sessions and chats it may not. The hits stay ordered by it;
+  // the value is withheld.
+  it('returns no score to a session- or chat-scoped caller, and still returns one to an unscoped key', async () => {
+    const unscoped = await provider.search({ q: 'hello' });
+    expect(unscoped.hits.map(hit => typeof hit.score)).toEqual(['number', 'number']);
+
+    const chats = await provider.search({ q: 'hello', chatIds: ['c2'] });
+    expect(chats.hits.map(hit => hit.chatId)).toEqual(['c2']);
+    expect(chats.hits[0].score).toBeUndefined();
+
+    const sessions = await provider.search({ q: 'hello', sessionIds: ['s1'] });
+    expect(sessions.hits.map(hit => hit.sessionId)).toEqual(['s1']);
+    expect(sessions.hits[0].score).toBeUndefined();
+
+    // A key stored with an empty session list is unrestricted: it searches every session and keeps its score.
+    const everySession = await provider.search({ q: 'hello', sessionIds: [] });
+    expect(everySession.hits.map(hit => typeof hit.score)).toEqual(['number', 'number']);
+  });
+
   it.each([0, 1])('returns no hits or count for an empty compiled chat scope at offset %s', async offset => {
     const result = await provider.search({ q: 'hello', chatIds: [], limit: 1, offset });
     expect(result.hits).toEqual([]);
@@ -185,6 +307,17 @@ describe('BuiltInFtsProvider (sqlite)', () => {
     for (const q of ['"unbalanced', '*foo', '(test', '262813461250071@lid', 'a@c.us']) {
       await expect(provider.search({ q })).resolves.toMatchObject({ provider: 'builtin-fts' });
     }
+  });
+
+  it('runs a repeated word once, since a repeat adds nothing under AND but costs a pass per match', async () => {
+    const query = jest.spyOn(ds, 'query');
+    const repeated = await provider.search({ q: Array.from({ length: 200 }, () => 'hello').join(' ') });
+    const single = await provider.search({ q: 'hello' });
+
+    const matched = query.mock.calls.filter(([sql]) => String(sql).includes('MATCH')).map(([, params]) => params);
+    expect((matched[0] as unknown[])[0]).toBe('"hello"');
+    expect((matched[1] as unknown[])[0]).toBe('"hello"');
+    expect(repeated.hits.map(h => h.messageId)).toEqual(single.hits.map(h => h.messageId));
   });
 
   it('keeps multi-token AND semantics after quoting', async () => {
@@ -220,6 +353,40 @@ describe('BuiltInFtsProvider (sqlite)', () => {
     expect(excluded.hits).toEqual([]);
   });
 
+  it('applies inclusive millisecond windows to rows and paginated totals', async () => {
+    await ds.getRepository(Message).insert(
+      [-2, -1, 0, 1, 2, 1_700_000_000, 1_700_000_001].map(timestamp => ({
+        sessionId: 's1',
+        chatId: 'c1',
+        from: 'a@c.us',
+        to: 'dest@c.us',
+        body: 'boundarywindow',
+        type: 'text',
+        direction: MessageDirection.OUTGOING,
+        timestamp,
+      })),
+    );
+    const windows = [
+      { dateFrom: 1000, dateTo: 2000, want: [2, 1] },
+      { dateFrom: 1001, dateTo: 1999, want: [] },
+      { dateFrom: 0, dateTo: 0, want: [0] },
+      { dateFrom: -1999, dateTo: -1, want: [-1] },
+      { dateFrom: -2000, dateTo: -1001, want: [-2] },
+      { dateFrom: 0.5, dateTo: 1999.5, want: [1] },
+      { dateFrom: 1000, dateTo: 1000, want: [1] },
+      { dateFrom: 2000, dateTo: 1000, want: [] },
+      { dateFrom: 1_700_000_000_001, dateTo: 1_700_000_001_000, want: [1_700_000_001] },
+    ];
+    for (const { want, ...bounds } of windows) {
+      const result = await provider.search({ q: 'boundarywindow', ...bounds });
+      expect(result.hits.map(hit => hit.timestamp)).toEqual(want);
+      expect(result.total).toBe(want.length);
+      const page = await provider.search({ q: 'boundarywindow', ...bounds, limit: 1, offset: 1 });
+      expect(page.hits.map(hit => hit.timestamp)).toEqual(want.slice(1, 2));
+      expect(page.total).toBe(want.length);
+    }
+  });
+
   it('the FTS UPDATE trigger carries a WHEN body-change guard (not fire on ack-only updates)', async () => {
     // The messages_fts_au trigger must be guarded so it only re-indexes when body actually changes.
     // Without the WHEN clause every ack (SENT→DELIVERED→READ) and reaction does a redundant FTS
@@ -242,5 +409,107 @@ describe('BuiltInFtsProvider (sqlite)', () => {
     expect(oldTerm.hits.map(h => h.body)).not.toContain('hello world');
     const newTerm = await provider.search({ q: 'goodbye' });
     expect(newTerm.hits.map(h => h.body)).toContain('goodbye updated');
+  });
+
+  describe('cooperative shutdown during trigram index build', () => {
+    const containsOn = new ConfigService({ search: { containsEnabled: true } });
+
+    it('stops trigram backfill between batches on destroy, keeps contains unavailable, and awaits the active batch', async () => {
+      const repo = ds.getRepository(Message);
+      const bulk = Array.from({ length: 2500 }, (_, i) => ({
+        sessionId: 's1',
+        chatId: 'c1',
+        from: 'a@c.us',
+        to: 'dest@c.us',
+        body: `bulk message ${i}`,
+        type: 'text' as const,
+        direction: MessageDirection.INCOMING,
+        timestamp: 100 + i,
+      }));
+      for (let i = 0; i < bulk.length; i += 200) await repo.insert(bulk.slice(i, i + 200));
+
+      const trigramProvider = new BuiltInFtsProvider(ds, containsOn);
+      const query = ds.query.bind(ds);
+      let backfillBatches = 0;
+      let releaseFirstBatch!: () => void;
+      const firstBatchGate = new Promise<void>(resolve => (releaseFirstBatch = resolve));
+      let enteredFirstBatch!: () => void;
+      const onFirstBatch = new Promise<void>(resolve => (enteredFirstBatch = resolve));
+
+      const querySpy = jest
+        .spyOn(ds, 'query')
+        .mockImplementation(async (sql: string, params?: Parameters<DataSource['query']>[1]) => {
+          if (/m\."rowid" > \?/.test(sql)) {
+            backfillBatches += 1;
+            if (backfillBatches === 1) {
+              enteredFirstBatch();
+              await firstBatchGate;
+            }
+          }
+          return query(sql, params);
+        });
+
+      const buildP = trigramProvider.buildContainsIndex();
+      await onFirstBatch;
+
+      let destroyed = false;
+      const destroyP = Promise.resolve(trigramProvider.onModuleDestroy()).then(() => {
+        destroyed = true;
+      });
+      await new Promise(resolve => setImmediate(resolve));
+      expect(destroyed).toBe(false);
+
+      releaseFirstBatch();
+      await destroyP;
+      await buildP;
+      querySpy.mockRestore();
+
+      expect(destroyed).toBe(true);
+      expect(backfillBatches).toBe(1);
+      await expect(trigramProvider.search({ q: 'bulk', match: 'contains' })).rejects.toBeInstanceOf(
+        NotImplementedException,
+      );
+      await expect(trigramProvider.search({ q: 'bulk', match: 'contains' })).rejects.toThrow(/still being built/);
+    });
+
+    it('does not start a trigram build when adapterHost.listen$ emits after onModuleDestroy', async () => {
+      const listen$ = new Subject<void>();
+      const adapterHost = { listening: false, listen$ } as unknown as HttpAdapterHost;
+      const trigramProvider = new BuiltInFtsProvider(ds, containsOn, adapterHost);
+      const buildSpy = jest.spyOn(trigramProvider, 'buildContainsIndex');
+
+      trigramProvider.onApplicationBootstrap();
+      await trigramProvider.onModuleDestroy();
+      listen$.next();
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(buildSpy).not.toHaveBeenCalled();
+    });
+
+    it('bounds onModuleDestroy when a trigram build query hangs', async () => {
+      jest.useFakeTimers();
+      try {
+        const hungDs = {
+          options: { type: 'better-sqlite3' },
+          query: jest.fn(() => new Promise(() => undefined)),
+        } as unknown as DataSource;
+        const trigramProvider = new BuiltInFtsProvider(hungDs, containsOn);
+
+        void trigramProvider.buildContainsIndex();
+        let destroyed = false;
+        const destroyP = Promise.resolve(trigramProvider.onModuleDestroy()).then(() => {
+          destroyed = true;
+        });
+
+        await jest.advanceTimersByTimeAsync(999);
+        expect(destroyed).toBe(false);
+        await jest.advanceTimersByTimeAsync(1);
+        expect(destroyed).toBe(true);
+        await destroyP;
+        expect(jest.getTimerCount()).toBe(0);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
   });
 });

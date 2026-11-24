@@ -88,7 +88,8 @@ docker compose restart openwa-api
 curl http://localhost:2785/api/health
 
 # Sessions reconnect on their own only with AUTO_START_SESSIONS=true. The production compose
-# leaves it unset (off), so start each session first:
+# leaves it unset (off), so start each session first. The boot log says how many it left down
+# (action=auto_start_disabled):
 #   curl -X POST -H "X-API-Key: $API_KEY" http://localhost:2785/api/sessions/{sessionId}/start
 # Check all sessions reconnected (id alongside status — the send below needs the id)
 curl -H "X-API-Key: $API_KEY" \
@@ -221,6 +222,38 @@ curl -H "X-API-Key: $API_KEY" \
 
 # Consider removing unused sessions
 
+# C. If memory climbs during a media burst (received, or sent on whatsapp-web.js):
+# on PostgreSQL each payload, received or the echo of a media send, waits in memory as base64
+# (about 4/3 of the file size) until its row is stored, in one of INBOUND_MEDIA_CONCURRENCY
+# slots per session, so a session holds at most INBOUND_MEDIA_CONCURRENCY x 4 x
+# ceil(MEDIA_DOWNLOAD_MAX_BYTES / 3) bytes (about 267 MiB at the defaults) even while inserts
+# stall. Lower either setting to shrink that bound (MEDIA_DOWNLOAD_MAX_BYTES also caps outbound
+# media sends), or set MEDIA_DOWNLOAD_ENABLED=false to hold none. Media logged as "No room for
+# inbound media" arrived with the omitted marker because no slot was freed for 2 x
+# MEDIA_DOWNLOAD_TIMEOUT_MS. A slot is held until its message's commit settles: the
+# message:received or message:sent hook chain, with RESOLVE_LID_TO_PHONE=true the sender's phone
+# lookup, the insert, and on whatsapp-web.js a timed-out page download (until
+# PUPPETEER_PROTOCOL_TIMEOUT_MS fails it). To find the holder, look for long-running inserts
+# (SELECT pid, now() - query_start, state, query FROM pg_stat_activity WHERE query ILIKE
+# 'INSERT INTO "messages"%') and for "Sandboxed plugin ... timed out after 5000ms" warnings: a
+# plugin loaded from the plugins directory delays a slot by at most 5 s per hook, so such a stall
+# clears on its own. A hook registered in-process (a plugin registered programmatically) has no
+# time limit: one that never settles keeps its chat's later messages from being stored and holds
+# every slot they or its own message took, for the life of the process. A reconnect does not free
+# them, so once INBOUND_MEDIA_CONCURRENCY slots are stuck the session sheds all media; fix or
+# remove that hook and restart the process. On SQLite a slow message:received or message:sent
+# plugin hook still holds payloads with no limit on how many.
+# Archiving (CHAT_MEDIA_ARCHIVE_ENABLED=true) adds its own cost on either database: each
+# message being archived holds its payload as base64 and decoded until the upload finishes (more
+# under MESSAGE_INLINE_MEDIA=archive, which also reads the file back and rewrites the row), and
+# nothing limits how many archive at once. Lowering CHAT_MEDIA_ARCHIVE_MAX_BYTES (25 MiB by
+# default) bounds that cost per message, since larger media are not archived, but not how many
+# archive at once; slow storage such as S3 makes more overlap. With QUEUE_ENABLED=false, webhook
+# deliveries to receivers that stop answering also hold their inline media (up to
+# 4/3 x WEBHOOK_MEDIA_INLINE_MAX_BYTES each as base64, for up to WEBHOOK_DISPATCH_CONCURRENCY
+# + WEBHOOK_DISPATCH_MAX_QUEUED deliveries); lower those settings or enable the queue.
+# Sizing: 12 - Troubleshooting & FAQ, "How many sessions can I run?"
+
 # 5. Long-term fix:
 # Edit docker-compose.yml
 # Increase memory limit or reduce max sessions
@@ -329,7 +362,7 @@ curl -X PUT http://localhost:2785/api/sessions/{sessionId}/webhooks/{webhookId} 
 #    it. The outbox sweep runs only while WEBHOOK_RECONCILE_INTERVAL_MS > 0 (default 60000). It
 #    sends an event again only if it was shed, refused at shutdown, or cut off by a restart or a
 #    database fault before its dispatch settled, and then only until WEBHOOK_RECONCILE_MAX_ATTEMPTS
-#    sweeps are spent, so such an event can show an attempts > 0 row while the sweep still holds it.
+#    replays are spent, so such an event can show an attempts > 0 row while the sweep still holds it.
 #    A row can be replayed only while step 2 lists it with "replayable": true, that is, it was
 #    recorded while WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS > 0 (with the queue on, also when the
 #    event was queued) and that window has not passed. With the default 0 no event data is kept
@@ -402,7 +435,8 @@ docker stats --no-stream
 #    copied live; stop the sessions first if a restore must not need re-pairing, and start them
 #    again in step 10
 docker exec -e BACKUP_DIR=/app/data/backups -e TMPDIR=/app/data/backups openwa-api ./scripts/backup.sh
-docker cp openwa-api:/app/data/backups/. ./backups/
+docker cp openwa-api:/app/data/backups/. ./backups/ \
+  && docker exec openwa-api sh -c 'rm -f /app/data/backups/openwa-backup-*.tar.gz'   # the copy off the volume is the backup
 
 # Verify backup (backup.sh writes $BACKUP_DIR/openwa-backup-<timestamp>.tar.gz,
 # BACKUP_DIR defaults to ./backups — it creates no dated subdirectories)
@@ -458,6 +492,23 @@ curl -H "X-API-Key: $API_KEY" \
 
 ---
 
+### Reference: Process Signals
+
+What each signal does to the gateway process. `docker stop`, Kubernetes and systemd send `SIGTERM`, and the `dumb-init` that is PID 1 in the image forwards every signal it receives.
+
+| Signal                                             | What the gateway does                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SIGTERM`, `SIGINT`, `SIGHUP`                      | Stops gracefully. Readiness answers `503` for `SHUTDOWN_DELAY_MS` (3 seconds unless `NODE_ENV` is `development` or `test`), then the ordered teardown runs and the process exits `0`, or `1` if the teardown failed or overran its budget. A second `SIGTERM` or `SIGINT` at least a second after the first exits `130` at once. A `SIGHUP` that arrives after another stop signal is ignored.                                                                                                                                                                                                       |
+| `SIGQUIT`, `SIGABRT`                               | Not handled. The default action ends the process at once, with a core dump where `ulimit -c` allows one. It is the way to get a core from a gateway whose event loop is blocked, where a handler could not run.                                                                                                                                                                                                                                                                                                                                                                                      |
+| `SIGUSR2`                                          | Not handled, so Node's diagnostic flags keep working. With `NODE_OPTIONS="--report-on-signal --report-directory=/app/data"` (or `--heapsnapshot-signal=SIGUSR2 --diagnostic-dir=/app/data`), `kill -USR2` writes the file to the data volume and the gateway keeps running. Name a writable directory: the working directory `/app` of the image is not writable, so without one the report is not written and a heap snapshot attempt ends the process with exit `1`. `--diagnostic-dir` does not move the report. Without a diagnostic flag the signal ends the process at once, with no teardown. |
+| `SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE`, `SIGTRAP` | Not handled. A crash in native code ends the process by that signal, with no teardown and no log line, so the container exits with status 139, 135, 132, 136 or 133 and its restart policy starts it again.                                                                                                                                                                                                                                                                                                                                                                                          |
+
+A closed terminal (`SIGHUP`) drains like any other stop: the log lines the gateway can no longer write to it, or to a log pipe that has broken, are lost instead of ending the stop early. Outside a stop, a lost log output still ends the process, as before.
+
+Read the status of a stopped container with `docker inspect -f '{{.State.ExitCode}}' openwa-api`.
+
+---
+
 ### Runbook: Version Upgrade
 
 **Trigger:** New version release
@@ -488,7 +539,8 @@ curl -H "X-API-Key: $API_KEY" \
 export BACKUP_DIR="/backups/openwa"
 mkdir -p "$BACKUP_DIR"
 docker exec -e BACKUP_DIR=/app/data/backups -e TMPDIR=/app/data/backups openwa-api ./scripts/backup.sh
-docker cp openwa-api:/app/data/backups/. "$BACKUP_DIR"/
+docker cp openwa-api:/app/data/backups/. "$BACKUP_DIR"/ \
+  && docker exec openwa-api sh -c 'rm -f /app/data/backups/openwa-backup-*.tar.gz'   # the copy off the volume is the backup
 
 # 3. Export the Data DB as JSON alongside the archive (admin key)
 curl -H "X-API-Key: $ADMIN_API_KEY" \
@@ -512,7 +564,7 @@ docker compose build openwa-api
 
 # 7. Run database migrations (if any)
 # Use migration:run:prod in the production image — `migration:run` needs ts-node + the TS
-# source, both stripped from the prod image by `npm ci --omit=dev`.
+# source, and the image ships neither: it holds the compiled dist/ only.
 docker compose run --rm openwa-api npm run migration:run:prod
 
 # 8. Start services
@@ -551,9 +603,12 @@ curl -X POST http://localhost:2785/api/sessions/{sessionId}/messages/send-text \
 
 > On Kubernetes with the chart in `charts/openwa`, take the step 2 backup with the Helm lines in
 > Runbook: Database Backup and the step 3 export first, then replace steps 4-8 with checking out the
-> new release and running `helm upgrade openwa ./charts/openwa --reuse-values`. The image tag defaults
-> to the chart's `appVersion`, so the checkout moves it, unless `image.tag` was set at install:
-> `--reuse-values` keeps that value, so pass `--set image.tag=<new-version>` in that case.
+> new release and running `helm upgrade openwa ./charts/openwa --reset-then-reuse-values` (Helm 3.14
+> or later). It takes the new chart's defaults and re-applies the values you set. Plain
+> `--reuse-values` renders the new templates with the old release's defaults instead, which keeps a
+> 45 s `terminationGracePeriodSeconds` and a capability list without `KILL`, so a stop never reaches
+> the app. The image tag defaults to the chart's `appVersion`, so the checkout moves it, unless
+> `image.tag` was set at install: that value is kept, so pass `--set image.tag=<new-version>` then.
 > Run steps 9-12 through `kubectl port-forward` to the release's Service. `helm rollback` keeps the
 > volume, so read the notes on restoring `sessions/` below before relying on it.
 
@@ -595,21 +650,55 @@ docker compose run --rm --no-deps --entrypoint /app/scripts/restore.sh \
 # under a new name, as the SQLite path keeps data.pre-restore-<ts>, and an empty one takes its place.
 # The container's own POSTGRES_USER and POSTGRES_DB name the role and database the app uses. The
 # image's pg_dump 17 writes `SET transaction_timeout = 0;`, which PostgreSQL 16 rejects, so sed
-# drops that line before psql
+# drops that line before psql. It also opens the dump with \restrict, which psql reads from 13.22,
+# 14.19, 15.14, 16.10 and 17.6 on, and no 12 ever does: an older one stops there with "invalid command
+# \restrict" and loads nothing. The third command fails on such a psql before anything is renamed; a
+# postgres:16-alpine pulled before August 2025 is one. Pull it again and recreate the container on its
+# kept volume (compose: `docker compose --profile postgres pull postgres` and the `up -d` below;
+# dashboard-created: `docker pull postgres:16-alpine` and `docker rm -f openwa-postgres`, then start
+# OpenWA once so it creates the container again, and stop it), then run these commands again
 docker compose --profile postgres up -d postgres   # dashboard-created: docker start openwa-postgres
 docker exec openwa-postgres sh -c 'until pg_isready -q -U "$POSTGRES_USER"; do sleep 1; done'
+docker exec openwa-postgres sh -c 'psql -X -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d postgres \
+  -c "\restrict openwa" -c "\unrestrict openwa"'
 docker exec openwa-postgres sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d postgres \
   -c "ALTER DATABASE \"$POSTGRES_DB\" RENAME TO \"${POSTGRES_DB}_pre_restore_$(date +%Y%m%d%H%M%S)\"" \
   -c "CREATE DATABASE \"$POSTGRES_DB\" OWNER \"$POSTGRES_USER\""'
 tar -xzOf "$BACKUP_DIR/openwa-backup-<timestamp>.tar.gz" ./database.sql | sed '/^SET transaction_timeout = 0;$/d' |
-  docker exec -i openwa-postgres sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+  docker exec -i openwa-postgres sh -c 'psql --single-transaction -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
 
 # An external PostgreSQL server: rename the upgraded database and create an empty one under the
-# DATABASE_NAME the app uses in the same way, then load the dump into it. DATABASE_URL is not an
+# DATABASE_NAME the app uses in the same way, then load the dump into it, with a psql that reads
+# \restrict as above (restore.sh refuses an older one on its PATH). DATABASE_URL is not an
 # OpenWA setting: fill in your own URL for that database, such as
-# postgres://<user>@<host>:5432/<database>, with the password in PGPASSWORD
+# postgres://<user>@<host>:5432/<database>, with the password in PGPASSWORD. With DATABASE_SSL=true,
+# run psql under PGSSLMODE=verify-full (require when DATABASE_SSL_REJECT_UNAUTHORIZED=false), as the
+# command restore.sh prints does; libpq's default sslmode=prefer accepts any certificate. verify-full
+# also needs PGSSLROOTCERT set to the server's CA file: libpq otherwise reads ~/.postgresql/root.crt,
+# and sslrootcert=system needs libpq 16+ and a system CA store, which the image lacks. One transaction:
+# a load that fails leaves nothing behind. An archive holding database.schema (a POSTGRES_SCHEMA other
+# than public) has that schema only: skip the rename and the empty database and load it into the
+# database the app uses, as restore.sh prints, as the app's role, or a member of it, that may create
+# schemas and extensions there and, when pg_trgm and unaccent live in that schema, owns them (the role
+# that created them: the app's own, or the one an earlier load ran as), or as a superuser. The same
+# goes for pgcrypto when the dump carries it, which it does only when pgcrypto lived in that schema
+# (PostgreSQL 12 or older, where the app creates it there for its ids). When another role owns the
+# schema, only a superuser can load it: the dump gives what is in it to the app's role before it
+# grants that role CREATE on the schema. After ALTER SCHEMA <schema> OWNER TO <app role>, a new
+# backup loads as that role. It moves the current copy of the schema aside as
+# <schema>_pre_restore_<time>, rows and all, and leaves the other schemas alone; pg_trgm and unaccent,
+# when they live in it, are dropped from the copy with its trigram index (idx_messages_body_trgm), and
+# such a pgcrypto with the copy's id column defaults, so the dump can create them again. A load that
+# stops at "cannot drop extension" means another schema uses them and nothing was changed; its DETAIL
+# lines name what. When that is another OpenWA deployment's idx_messages_body_trgm, drop that index and
+# load again: that deployment's contains search then reads its whole messages table until its next
+# start builds the index again, and answers 501 while it builds. Drop anything else named first and
+# recreate it after the load. Into an empty database, an extension it uses (pg_trgm, unaccent) that
+# lives in another application's schema has to exist first, and on PostgreSQL 12 or older so does a
+# pgcrypto that lived outside the app's schema, in the schema it lived in (the dump leaves that one
+# out). A pgcrypto that lived in the app's schema is created by the load: do not create it first
 tar -xzOf "$BACKUP_DIR/openwa-backup-<timestamp>.tar.gz" ./database.sql | sed '/^SET transaction_timeout = 0;$/d' |
-  psql -v ON_ERROR_STOP=1 "$DATABASE_URL"
+  psql --single-transaction -v ON_ERROR_STOP=1 "$DATABASE_URL"
 
 # 3. Check out the previous release and rebuild the image
 git checkout v<old-version>
@@ -623,15 +712,17 @@ curl -H "X-API-Key: $API_KEY" http://localhost:2785/api/health
 ```
 
 > Restoring `sessions/` is required, not optional, when the rollback crosses a browser major upgrade (on
-> amd64, 0.23.5 moved Chrome for Testing from 146 to 153; arm64 runs the chromium Debian shipped when each
-> image was built), and the backup must predate the first start on the newer image; a daily backup taken
-> after the upgrade does not qualify. An older Chrome silently deletes the IndexedDB of a profile a newer
-> Chrome has opened, which is where whatsapp-web.js keeps the WhatsApp login. The symptom: every
-> previously linked whatsapp-web.js session starts at a QR code instead of reconnecting, the log names no
-> cause (0.23.3 and 0.23.4 log only a generic `relink_required` warning), and upgrading again does not
-> bring the pairing back. Changing only the image tag, or `helm rollback` (which keeps the volume), skips
-> the restore and hits this. A session first paired on the newer image is not in that backup and must be
-> paired again either way. Baileys sessions are unaffected.
+> amd64, 0.23.5 moved Chrome for Testing from 146 to 153, 0.26.0 moves it to 156, 0.29.0 moves it to 157 and 0.31.0 moves it to 158; arm64
+> runs the chromium Debian shipped when each image was built; a source install without
+> `PUPPETEER_EXECUTABLE_PATH` runs the Chrome Puppeteer downloads, which moved from 156 to 157 with Puppeteer
+> 25.17.0), and the backup must predate the first start
+> on the newer image; a daily backup taken after the upgrade does not qualify. An older Chrome silently
+> deletes the IndexedDB of a profile a newer Chrome has opened, which is where whatsapp-web.js keeps the
+> WhatsApp login. The symptom: every previously linked whatsapp-web.js session starts at a QR code instead
+> of reconnecting, the log names no cause (0.23.3 and 0.23.4 log only a generic `relink_required` warning),
+> and upgrading again does not bring the pairing back. Changing only the image tag, or `helm rollback`
+> (which keeps the volume), skips the restore and hits this. A session first paired on the newer image is
+> not in that backup and must be paired again either way. Baileys sessions are unaffected.
 
 > Restoring `sessions/` **and** `baileys/` is likewise required when rolling back past 0.23.5, on either
 > engine and either architecture. 0.23.5 renames each session's auth directory from the session name to
@@ -658,19 +749,22 @@ curl -H "X-API-Key: $API_KEY" http://localhost:2785/api/health
 
 **Trigger:** Daily schedule, before maintenance, before upgrade
 
-**Impact:** The databases are snapshotted consistently online (`sqlite3 .backup`, `pg_dump`). Each
-SQLite file (`main.sqlite` on every deployment, plus the data database with `DATABASE_TYPE=sqlite`)
-is copied under a read lock, and an app write that meets it waits for the copy to end, failing if the
-copy outlasts the 30 s busy timeout. The SQLite driver waits synchronously, so while a write waits the
-whole gateway stalls with it (API, WebSocket, engine events, health probes), not only that write; run
-the backup in a quiet window, or stop the container for a large database. Engine authentication
-state (`sessions/`, `baileys/`) is copied while the engines write it, so a restored session can need
-re-pairing; for a copy that is consistent by construction, stop the sessions first
-(`POST /api/sessions/:id/stop`), or stop the container and archive the volume. A stopped session
-stays down across restarts, even with `AUTO_START_SESSIONS=true`, so start each one again with
-`POST /api/sessions/:id/start` once the backup is copied. From 0.24.0 the stop is recorded in the
-backed-up database, so a restore of that archive keeps the session stopped too; an archive taken on
-0.23.7 or earlier records no stop.
+**Impact:** The databases are snapshotted consistently online (`sqlite3 .backup`, `pg_dump`). With
+the default `SQLITE_JOURNAL_MODE=WAL`, `sqlite3 .backup` captures both the base `.sqlite` file and
+any uncheckpointed `-wal` transactions consistently without blocking concurrent writers; under
+`SQLITE_JOURNAL_MODE=DELETE` (rollback-journal mode), each SQLite file (`main.sqlite` on every
+deployment, plus the data database with `DATABASE_TYPE=sqlite`) is copied under a read lock, so an
+app write waits up to the 30 s busy timeout (blocking the synchronous SQLite driver on the event
+loop). If the `sqlite3` CLI is unavailable on the backup host and a non-empty `-wal` sidecar exists,
+`scripts/backup.sh` refuses to run rather than silently dropping uncheckpointed WAL transactions:
+install `sqlite3` or stop OpenWA cleanly first (clean shutdown runs `PRAGMA wal_checkpoint(TRUNCATE)`).
+Engine authentication state (`sessions/`, `baileys/`) is copied while the engines write it, so a
+restored session can need re-pairing; for a copy that is consistent by construction, stop the
+sessions first (`POST /api/sessions/:id/stop`), or stop the container and archive the volume. A
+stopped session stays down across restarts, even with `AUTO_START_SESSIONS=true`, so start each one
+again with `POST /api/sessions/:id/start` once the backup is copied. From 0.24.0 the stop is recorded
+in the backed-up database, so a restore of that archive keeps the session stopped too; an archive
+taken on 0.23.7 or earlier records no stop.
 
 **Prerequisites:**
 
@@ -688,12 +782,21 @@ User-managed files outside that list (for example the project-level `.env`) must
 # scripts/backup.sh captures:
 #   - main.sqlite   — auth (API keys) + audit log   (ALWAYS SQLite; MAIN_DATABASE_NAME, default ./data/main.sqlite)
 #   - openwa.sqlite — user data                      (DATABASE_NAME, default ./data/openwa.sqlite;
-#                                                     or a pg_dump when DATABASE_TYPE=postgres)
+#                                                     or a pg_dump when DATABASE_TYPE=postgres; a
+#                                                     POSTGRES_SCHEMA other than public is dumped
+#                                                     alone, and database.schema names it; that
+#                                                     dump needs pg_dump 14 or newer, and the
+#                                                     image ships 17; loading a dump its
+#                                                     pg_dump makes needs psql 13.22, 14.19,
+#                                                     15.14, 16.10, 17.6 or newer, never a 12)
 #   - sessions/     — whatsapp-web.js state (SESSION_DATA_PATH)
 #   - baileys/      — Baileys credentials (BAILEYS_AUTH_DIR)
 #   - media/        — local media                    (STORAGE_LOCAL_PATH, archived whenever present; with
-#                                                     STORAGE_TYPE=s3 it holds only files the app could not
-#                                                     write to the bucket, so back up the bucket separately)
+#                                                     STORAGE_TYPE=s3 it holds the files the app could not
+#                                                     write to the bucket and, after a move from local
+#                                                     storage, the old local media until 14 - Migration
+#                                                     Guide (Storage Migration, Step 6) cleans it up, so
+#                                                     back up the bucket separately)
 #   - plugin-packages/ — installed plugin code from PLUGINS_DIR
 #                        (not packages in a legacy ./plugins, which the app still loads while
 #                        PLUGINS_DIR is unset; backup.sh warns about those)
@@ -703,16 +806,16 @@ User-managed files outside that list (for example the project-level `.env`) must
 #                                  (.api-key from BOOTSTRAP_KEY_FILE when that is set)
 #
 # The database paths resolve exactly like the app: MAIN_DATABASE_NAME / DATABASE_NAME from the
-# environment, then ./.env, then <data dir>/.env.generated, otherwise the fixed ./data defaults, which
-# are NOT derived from OPENWA_DATA_DIR. A missing source database fails the run (no silent empty
-# backup), the finished archive is checked to contain every configured database, and with the sqlite3
-# CLI present the databases are snapshotted online via .backup (otherwise plain-copied with a
-# CONSISTENCY-WARNING marker inside the archive). sessions/ and baileys/ are plain copies: when a
-# whatsapp-web.js profile is open or Baileys state is present, the archive carries an
-# ENGINE-STATE-NOTE naming them, which restore.sh prints and never refuses.
+# environment, then ./.env, then <data dir>/.env.generated, otherwise the app's ./data defaults,
+# read under OPENWA_DATA_DIR like every other ./data path. A missing source database fails the run
+# (no silent empty backup), the finished archive is checked to contain every configured database,
+# and with the sqlite3 CLI present the databases are snapshotted online via .backup (otherwise
+# plain-copied with a CONSISTENCY-WARNING marker inside the archive). sessions/ and baileys/ are
+# plain copies: when a whatsapp-web.js profile is open or Baileys state is present, the archive
+# carries an ENGINE-STATE-NOTE naming them, which restore.sh prints and never refuses.
 
-# Run from the repo root (database defaults are ./data/... there; other state defaults to
-# OPENWA_DATA_DIR; a ./data/... path from .env.generated, database paths included, is read under it):
+# Run from the repo root (OPENWA_DATA_DIR defaults to ./data; the ./data defaults and a ./data/...
+# path from ./.env or .env.generated are read under it):
 ./scripts/backup.sh
 
 # Customize via environment. Keep the password out of DATABASE_URL: the URL is passed to pg_dump as
@@ -727,6 +830,8 @@ OPENWA_DATA_DIR=/srv/openwa/data \
 # Node trusts (add a private CA through NODE_EXTRA_CA_CERTS, as for the app), or sslmode=require when
 # DATABASE_SSL_REJECT_UNAUTHORIZED=false. On a host without node it uses sslrootcert=system, which needs
 # libpq 16+ and a system CA store. PGSSLMODE and PGSSLROOTCERT, when set, take precedence.
+# verify-full also matches the host pg_dump connects to, DATABASE_URL's included, against the
+# certificate, so name the host the certificate carries.
 ```
 
 > The data directory is a Docker **named volume** (`openwa-data`) in the production
@@ -740,9 +845,11 @@ OPENWA_DATA_DIR=/srv/openwa/data \
 >
 > ```bash
 > docker exec -e BACKUP_DIR=/app/data/backups -e TMPDIR=/app/data/backups openwa-api ./scripts/backup.sh
-> docker cp openwa-api:/app/data/backups/. ./backups/
+> docker cp openwa-api:/app/data/backups/. ./backups/ \
+>   && docker exec openwa-api sh -c 'rm -f /app/data/backups/openwa-backup-*.tar.gz'   # do not let archives pile up on the volume
 > # Helm: kubectl exec <pod> -- env BACKUP_DIR=/app/data/backups ./scripts/backup.sh
-> #       kubectl cp <pod>:/app/data/backups ./backups
+> #       kubectl cp <pod>:/app/data/backups ./backups \
+> #         && kubectl exec <pod> -- sh -c 'rm -f /app/data/backups/openwa-backup-*.tar.gz'
 > ```
 >
 > The script stages a full copy of the data in `TMPDIR` before archiving it. The compose file mounts
@@ -756,42 +863,82 @@ OPENWA_DATA_DIR=/srv/openwa/data \
 > first, then `./.env`, then `<data dir>/.env.generated`. Settings made through Dashboard >
 > Infrastructure therefore apply without being restated on the command line. A restore reads that
 > third layer from the archive's `.env.generated` when the archive carries one, because that copy
-> replaces the target's and is the one the restored app reads. A relative `./data/...` path in
-> `.env.generated`, such as the `STORAGE_LOCAL_PATH=./data/media` the app writes on first run, names a
-> path in the data directory and is read under `OPENWA_DATA_DIR`; one from the environment or `./.env`
-> is read against the current directory. When operating directly on the host mount, a path recorded
-> inside the container (`/app/data/...`) is not host-visible, so override it in the environment. The
-> database defaults are relative to the current directory too, so pass `MAIN_DATABASE_NAME` and, for
-> SQLite, `DATABASE_NAME` with their paths on the mount. A `./data/...` path in `./.env` needs the same
-> override, such as the `PLUGINS_DIR=./data/plugins` that `.env.example` sets: compose passes it to
-> the container, where it names a path in the volume, while the scripts read it against the current
-> directory.
+> replaces the target's and is the one the restored app reads. A path that copy names has to stay in
+> the data directory unless it is the default (a leftover `./uploads` included): the restore stops,
+> naming the key and before it copies anything, at one that leads elsewhere, whether outside the
+> directory, through `..`, a link or a link that does not resolve, inside or around another
+> directory it refills from the archive, or at the path of a file it writes after the directories
+> (the admin key file, `.env.generated`, `database.sql`). Set that key in the environment or `./.env` to restore
+> there. A relative `./data/...` path in `./.env` or `.env.generated`, such as the
+> `PLUGINS_DIR=./data/plugins` that `.env.example` sets or the `STORAGE_LOCAL_PATH=./data/media` the
+> app writes on first run, names a path in the app's data directory and is read under
+> `OPENWA_DATA_DIR`, as are the `./data` database and state defaults; a path from the environment is
+> read against the current directory. When operating directly on the host mount, a path recorded
+> inside the container (`/app/data/...`) is not host-visible, so override it in the environment.
 >
-> On every install, inside a container or not, a quoted value followed by a `#` comment or not
-> closed on its line, a quoted value containing its own quote character or ending in a backslash, a
-> double-quoted value with a backslash, or a `KEY: value` line in `./.env` or `.env.generated` stops
-> the script with an error naming the key, before anything is archived or restored. So does a bare
-> CR, U+2028 or U+2029 on any line naming the key, a comment included, since the app starts a new
-> line there; a NUL or a byte that is not UTF-8 on a line setting the key; a byte-order mark or a
-> Unicode blank (such as a no-break space) before the key, around its `=` or at either end of its
-> value; a bare `NAME:` line right before the key's line, which the app reads as `NAME`'s value;
-> and a key whose value the app takes from a later line, either a bare `KEY` line followed, past
-> any blank lines, by one starting with `=` or an empty `KEY=` followed by a quoted value. The app
-> reads such a line, so neither the script default nor a guess is safe to use. `DATABASE_NAME` is
-> not read by a PostgreSQL backup through `DATABASE_URL` or by the restore of a PostgreSQL archive,
-> and an unreadable `ENGINE_TYPE` only skips the warning about missing Baileys state.
+> A leftover `STORAGE_LOCAL_PATH=./uploads` (which v0.2.0 to v0.7.3 wrote to `.env.generated`), in
+> `./.env` or `.env.generated`, is read as `<OPENWA_DATA_DIR>/media` whenever `OPENWA_DATA_DIR` is
+> not the current directory's own `./data`, since the current directory's `./uploads` is then not
+> the app's. A `./data` symlink counts as that directory even before its target exists. On bare metal
+> with `./data` linking to a data directory kept elsewhere, create the link before restoring, or pass
+> an absolute `STORAGE_LOCAL_PATH="$PWD/uploads"` in the environment; otherwise the media goes to the
+> data directory's `media/` while the app keeps serving `./uploads`. A container that mounts a host
+> `./uploads` at `/app/uploads` as its media directory, which no shipped compose file or chart does,
+> needs the same absolute `STORAGE_LOCAL_PATH` in the environment; the scripts warn when they skip a
+> non-empty `./uploads` while the data directory's `media/` is missing or empty, as it is in a volume
+> such a container has booted on. The scripts cannot tell bare metal from a checkout whose `./data` is
+> bind-mounted into the container, as in `docker-compose.dev.yml`, or from a root run inside a
+> container with a writable root filesystem, and keep `./uploads` there; pass
+> `STORAGE_LOCAL_PATH=./data/media` in the environment when restoring into an empty data directory in
+> those layouts.
+>
+> On every install, inside a container or not, the scripts stop with an error naming the key, before
+> anything is archived or restored, when the last line setting it in `./.env` or `.env.generated`,
+> which is the one the app keeps, has one of these forms:
+>
+> - a quoted value followed by a `#` comment or not closed on its line
+> - a quoted value containing its own quote character, or ending in a backslash the app can read
+>   past to a later quote of that kind followed only by blanks or a comment
+> - a double-quoted value with a backslash
+> - a `KEY: value` or `KEY:value` line (Docker Compose reads both from `./.env` into the container)
+> - a NUL or a byte that is not UTF-8
+> - a byte-order mark or a Unicode blank (such as a no-break space) before the key, around its `=`,
+>   at either end of an unquoted value or after a closing quote
+> - a bare `NAME:` line right before the key's line, which the app reads as `NAME`'s value
+> - a bare `KEY` line followed, past any blank lines, by one starting with `=`, or an empty `KEY=`
+>   followed by a quoted value, which the app reads as the key's value
+> - a quoted value opened on an earlier line, the key's own or another key's, that the app can read
+>   on to the key's line, which then belongs to that value
+>
+> A bare CR, U+2028 or U+2029 on any line naming the key, a comment included, stops the run too,
+> since the app can start a setting right after one. Like the app, the scripts break lines at a bare
+> CR, and at a U+2028 or U+2029 outside an unquoted value. The app reads each of these lines
+> (`KEY:value` only through Docker Compose, from `./.env`), so neither the script default nor a
+> guess is safe to use. `DATABASE_NAME` is not read by a PostgreSQL backup through `DATABASE_URL` or
+> by the restore of a PostgreSQL archive, and an unreadable `ENGINE_TYPE` only skips the warning
+> about missing Baileys state.
+>
 > Move the comment to its own line and keep the quotes (an unquoted value ends at a `#` and loses
 > its outer blanks), wrap the value in a quote character it does not contain, single-quote a value
 > whose backslashes are literal and not at its end (inside double quotes the app turns `\n` and `\r`
 > into line breaks; if that is intended, pass the key in the environment), write `KEY=value` on one
-> line for `KEY: value` and for a value on a later line, give a bare `NAME:` line a value or remove
-> it, save the file as UTF-8 with ASCII blanks and LF or CRLF line endings, or pass the key in the
-> environment. A restore reads the archive's `.env.generated`, which cannot be edited in place, so a
-> key it holds in such a form has to be passed in the environment. Blanks around `=`, CRLF line
-> endings, a value in one pair of quotes and a `#` comment after an unquoted value are read as the
-> app reads them. The scripts read the file line by line, so a line for the key inside a quoted
-> value that spans several lines, another key's or an earlier one for the same key, is taken as a
-> setting, although the app reads it as part of that value.
+> line for `KEY: value`, `KEY:value` and a value on a later line, close a quote left open on an
+> earlier line, give a bare `NAME:` line a value or remove it, save the file as UTF-8 with ASCII
+> blanks and LF or CRLF line endings, or pass the key in the environment. A restore reads the
+> archive's `.env.generated`, which cannot be edited in place, so a key it holds in such a form has
+> to be passed in the environment, and so does a `DATABASE_*` value saved from
+> Dashboard > Infrastructure in one of these forms, since the next save writes it the same way. The
+> scripts need `tr`, `tail`, `sed` and `grep` to read either file and stop when one is missing.
+> Blanks around `=`, CRLF line endings, a value in one pair of quotes and a `#` comment after an
+> unquoted value are read as the app reads them, and so is a quoted value that spans several lines
+> (a PEM key, say) and closes before the key's line, even when it holds quotes of another kind.
+>
+> Under Docker Compose the container gets `./.env` through Compose, which reads some values
+> differently from the app's own reader: it keeps backticks and a `#` with no blank before it as part
+> of the value, and expands `$NAME` outside single quotes. Run inside the container, the scripts see
+> the value Compose passed in; run on the host, they read `./.env` as the app reads a `.env` file, so
+> a value of that kind can resolve differently there. Single-quote such a value in `./.env`, or pass
+> the key in the environment on the host.
 
 **Verification:**
 
@@ -822,9 +969,12 @@ tar -tzf "$(ls -t ./backups/openwa-backup-*.tar.gz | head -n 1)"
 **Steps:**
 
 Use the repo's `scripts/restore.sh`. It restores `main.sqlite` (auth/audit) and a SQLite data store;
-for PostgreSQL it stages `database.sql` for the explicit import below. It also restores
-whatsapp-web.js/Baileys auth state, local media, plugins, and generated secret/config files. It snapshots
-the current data dir first so a bad restore can be undone:
+for PostgreSQL it stages `database.sql` for the explicit import below. An archive that holds the SQLite
+data store is refused, before anything is written, while `DATABASE_TYPE` is `postgres`: restore it into a
+SQLite install, then move that install as [14.3](./14-migration-guide.md#143-database-migration-sqlite--postgresql)
+shows. It also restores whatsapp-web.js/Baileys auth state, local media, plugins, and generated
+secret/config files, all as the archive holds them, so restore only archives you made. It snapshots the
+current data dir first so a bad restore can be undone:
 
 ```bash
 # 1. Stop the app (so files are quiescent)
@@ -832,9 +982,9 @@ docker compose down
 
 # 2. Restore from an archive produced by scripts/backup.sh
 #    (databases land on MAIN_DATABASE_NAME / DATABASE_NAME, default ./data/... — the same paths
-#    the app reads, as the environment, ./.env or the archive's .env.generated set them; non-DB
-#    state defaults to OPENWA_DATA_DIR; a ./data/... path from .env.generated, database paths
-#    included, is read under it. Pass --strict to refuse an archive whose CONSISTENCY-WARNING
+#    the app reads, as the environment, ./.env or the archive's .env.generated set them; the ./data
+#    defaults and a ./data/... path from ./.env or .env.generated are read under OPENWA_DATA_DIR,
+#    as for the backup. Pass --strict to refuse an archive whose CONSISTENCY-WARNING
 #    marker reports plain-copied, possibly-torn database snapshots;
 #    an ENGINE-STATE-NOTE (engine auth state that may have been copied while the app ran) is only printed.
 #    Restoring over an existing install's live databases requires --force; without it the script
@@ -848,21 +998,58 @@ docker compose down
 #    The current database is kept under a new name, as the data dir is kept in data.pre-restore-<ts>,
 #    and an empty one takes its place. The container's own POSTGRES_USER and POSTGRES_DB name the
 #    role and database the app uses. The image's pg_dump 17 writes `SET transaction_timeout = 0;`,
-#    which PostgreSQL 16 rejects, so sed drops that line before psql
+#    which PostgreSQL 16 rejects, so sed drops that line before psql. It also opens the dump with
+#    \restrict, which psql reads from 13.22, 14.19, 15.14, 16.10 and 17.6 on, and no 12 ever does: an
+#    older one stops there with "invalid command \restrict" and loads nothing. The third command fails
+#    on such a psql before anything is renamed; a postgres:16-alpine pulled before August 2025 is one.
+#    Pull it again and recreate the container on its kept volume (compose: `docker compose --profile
+#    postgres pull postgres` and the `up -d` below; dashboard-created: `docker pull postgres:16-alpine`
+#    and `docker rm -f openwa-postgres`, then start OpenWA once so it creates the container again, and
+#    stop it), then run these commands again
 docker compose --profile postgres up -d postgres   # dashboard-created: docker start openwa-postgres
 docker exec openwa-postgres sh -c 'until pg_isready -q -U "$POSTGRES_USER"; do sleep 1; done'
+docker exec openwa-postgres sh -c 'psql -X -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d postgres \
+  -c "\restrict openwa" -c "\unrestrict openwa"'
 docker exec openwa-postgres sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d postgres \
   -c "ALTER DATABASE \"$POSTGRES_DB\" RENAME TO \"${POSTGRES_DB}_pre_restore_$(date +%Y%m%d%H%M%S)\"" \
   -c "CREATE DATABASE \"$POSTGRES_DB\" OWNER \"$POSTGRES_USER\""'
 tar -xzOf ./backups/openwa-backup-<timestamp>.tar.gz ./database.sql | sed '/^SET transaction_timeout = 0;$/d' |
-  docker exec -i openwa-postgres sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+  docker exec -i openwa-postgres sh -c 'psql --single-transaction -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
 
 #    An external PostgreSQL server: rename the current database and create an empty one under the
-#    DATABASE_NAME the app uses in the same way, then load the dump into it. DATABASE_URL is not an
+#    DATABASE_NAME the app uses in the same way, then load the dump into it, with a psql that reads
+#    \restrict as above (restore.sh refuses an older one on its PATH). DATABASE_URL is not an
 #    OpenWA setting: fill in your own URL for that database, such as
-#    postgres://<user>@<host>:5432/<database>, with the password in PGPASSWORD
+#    postgres://<user>@<host>:5432/<database>, with the password in PGPASSWORD. With
+#    DATABASE_SSL=true, run psql under PGSSLMODE=verify-full (require when
+#    DATABASE_SSL_REJECT_UNAUTHORIZED=false), as the command restore.sh prints does; libpq's default
+#    sslmode=prefer accepts any certificate. verify-full also needs PGSSLROOTCERT set to the server's
+#    CA file: libpq otherwise reads ~/.postgresql/root.crt, and sslrootcert=system needs libpq 16+
+#    and a system CA store, which the image lacks. One transaction: a load that fails leaves nothing
+#    behind. An archive holding database.schema (a POSTGRES_SCHEMA other than public) has that schema
+#    only: skip the rename and the empty database and load it into the database the app uses, as
+#    restore.sh prints, as the app's role, or a member of it, that may create schemas and extensions
+#    there and, when pg_trgm and unaccent live in that schema, owns them (the role that created them:
+#    the app's own, or the one an earlier load ran as), or as a superuser. The same goes for pgcrypto
+#    when the dump carries it, which it does only when pgcrypto lived in that schema (PostgreSQL 12
+#    or older, where the app creates it there for its ids). When another role owns the schema, only a
+#    superuser can load it: the dump gives what is in it to the app's role before it grants that role
+#    CREATE on the schema. After ALTER SCHEMA <schema> OWNER TO <app role>, a new backup loads as
+#    that role. It moves the current copy of the schema aside as <schema>_pre_restore_<time>, rows
+#    and all, and leaves the other schemas alone; pg_trgm and unaccent, when they live in it, are
+#    dropped from the copy with its trigram index (idx_messages_body_trgm), and such a pgcrypto with
+#    the copy's id column defaults, so the dump can create them again. A load that stops at "cannot
+#    drop extension" means another schema uses them and nothing was changed; its DETAIL lines name
+#    what. When that is another OpenWA deployment's idx_messages_body_trgm, drop that index and load
+#    again: that deployment's contains search then reads its whole messages table until its next
+#    start builds the index again, and answers 501 while it builds. Drop anything else named first
+#    and recreate it after the load. Into an empty database, an extension it uses (pg_trgm, unaccent)
+#    that lives in another application's schema has to exist first, and on PostgreSQL 12 or older so
+#    does a pgcrypto that lived outside the app's schema, in the schema it lived in (the dump leaves
+#    that one out). A pgcrypto that lived in the app's schema is created by the load: do not create
+#    it first
 tar -xzOf ./backups/openwa-backup-<timestamp>.tar.gz ./database.sql | sed '/^SET transaction_timeout = 0;$/d' |
-  psql -v ON_ERROR_STOP=1 "$DATABASE_URL"
+  psql --single-transaction -v ON_ERROR_STOP=1 "$DATABASE_URL"
 
 # 4. Start the app and CONFIRM an existing API key still authenticates
 docker compose up -d
@@ -1009,7 +1196,9 @@ sudo certbot certificates
 
 # Restart nginx/proxy
 sudo systemctl restart nginx
-# or
+# or, for a proxy run as a compose service, as in the release compose file of 10 - DevOps &
+# Infrastructure (the shipped compose files run no proxy); add -f <file> when that file is not your
+# default compose file
 docker compose restart nginx
 
 # Verify HTTPS

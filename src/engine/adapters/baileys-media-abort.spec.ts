@@ -24,7 +24,10 @@ function imageMessage(id: string, fileLength: number): WAMessage {
   };
 }
 
-function build(dispatcher?: object): { events: BaileysEvents; warns: string[] } {
+function build(
+  dispatcher?: object,
+  overrides: Partial<BaileysEventsHost> = {},
+): { events: BaileysEvents; warns: string[] } {
   const warns: string[] = [];
   const events = new BaileysEvents({
     getSocket: () => ({ updateMediaMessage: jest.fn() }) as unknown as WASocket,
@@ -52,10 +55,12 @@ function build(dispatcher?: object): { events: BaileysEvents; warns: string[] } 
     getOnMessageEdited: () => undefined,
     getOnMessageReaction: () => undefined,
     getOnMessageAck: () => undefined,
+    getOnMessageReceipt: () => undefined,
     getOnGroupEvent: () => undefined,
     getOnCall: () => undefined,
     getOnPresenceUpdate: () => undefined,
     getOnCallOutcome: () => undefined,
+    ...overrides,
   } as unknown as BaileysEventsHost);
   return { events, warns };
 }
@@ -180,14 +185,14 @@ describe('BaileysEvents media download through a session proxy', () => {
     expect(downloadMediaMessage).toHaveBeenCalledWith(
       expect.anything(),
       'stream',
-      { options: { dispatcher } },
+      { options: { dispatcher, signal: expect.any(AbortSignal) as AbortSignal } },
       expect.anything(),
     );
   });
 
-  // An unproxied session passes no dispatcher at all, which is Baileys' own default, and the
-  // download must not start carrying an empty options object instead.
-  it('passes no fetch options for an unproxied session', async () => {
+  // An unproxied session passes no dispatcher at all, which is Baileys' own default, while still
+  // forwarding the download AbortSignal.
+  it('passes no proxy dispatcher for an unproxied session while forwarding AbortSignal', async () => {
     downloadMediaMessage.mockResolvedValue({
       // eslint-disable-next-line @typescript-eslint/require-await
       async *[Symbol.asyncIterator]() {
@@ -198,6 +203,32 @@ describe('BaileysEvents media download through a session proxy', () => {
 
     await events.mapMessage(imageMessage('DIRECT', 3), 'imageMessage');
 
-    expect(downloadMediaMessage).toHaveBeenCalledWith(expect.anything(), 'stream', {}, expect.anything());
+    expect(downloadMediaMessage).toHaveBeenCalledWith(
+      expect.anything(),
+      'stream',
+      { options: { signal: expect.any(AbortSignal) as AbortSignal } },
+      expect.anything(),
+    );
+    const calls = downloadMediaMessage.mock.calls as unknown[][];
+    const passedOpts = calls[0]?.[2] as { options?: Record<string, unknown> };
+    expect(passedOpts.options).not.toHaveProperty('dispatcher');
+  });
+
+  // A message still queued when the session is torn down gets its turn afterwards. Reading the
+  // dispatcher first would rebuild one that the teardown had just closed, for nothing to close again.
+  it('builds no proxy dispatcher for a download whose session is already torn down', async () => {
+    const getFetchDispatcher = jest.fn(() => undefined);
+    const { events } = build(undefined, {
+      getSocket: () => {
+        throw new Error('Engine is not ready');
+      },
+      getFetchDispatcher,
+    });
+
+    const incoming = await events.mapMessage(imageMessage('LATE', 3), 'imageMessage');
+
+    expect(incoming.media).toMatchObject({ omitted: true });
+    expect(downloadMediaMessage).not.toHaveBeenCalled();
+    expect(getFetchDispatcher).not.toHaveBeenCalled();
   });
 });

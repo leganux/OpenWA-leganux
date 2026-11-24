@@ -1,3 +1,5 @@
+import { getActiveApiKeyId } from './authLifecycle.ts';
+
 interface Page<T> {
   data: T[];
   total: number;
@@ -18,14 +20,27 @@ interface FetchAllPagesOptions {
 // stops a walk at 50 pages of 200: half the minute's budget stays for the caller's own reads of that
 // route, and an hour's budget holds about 20 such walks.
 const THROTTLE_RETRIES = 2;
+/** The longest Retry-After a retry waits for, so a refusal that names a long outage still ends the load soon. */
+const MAX_RETRY_AFTER_MS = 10_000;
 
-async function retryThrottled<T>(fetchOnce: () => Promise<T>, delayMs: number): Promise<T> {
+/**
+ * Retry a refusal whose status is in `statuses` (429 unless told otherwise) at most THROTTLE_RETRIES times,
+ * `delayMs` apart and doubling. A 429 keeps those waits, for the tiers above; any other retried refusal waits at
+ * least the `retryAfterSeconds` it carries, up to MAX_RETRY_AFTER_MS.
+ */
+export async function retryThrottled<T>(
+  fetchOnce: () => Promise<T>,
+  delayMs: number,
+  statuses: readonly number[] = [429],
+): Promise<T> {
   for (let attempt = 0; ; attempt++) {
     try {
       return await fetchOnce();
     } catch (err) {
-      if ((err as { status?: number }).status !== 429 || attempt >= THROTTLE_RETRIES) throw err;
-      await new Promise(resolve => setTimeout(resolve, delayMs * 2 ** attempt));
+      const { status, retryAfterSeconds } = err as { status?: number; retryAfterSeconds?: number };
+      if (status === undefined || !statuses.includes(status) || attempt >= THROTTLE_RETRIES) throw err;
+      const asked = status === 429 ? 0 : Math.min((retryAfterSeconds ?? 0) * 1000, MAX_RETRY_AFTER_MS);
+      await new Promise(resolve => setTimeout(resolve, Math.max(delayMs * 2 ** attempt, asked)));
     }
   }
 }
@@ -49,13 +64,19 @@ export async function fetchAllPages<T>(
   let offset = 0;
   // Logout cancels nothing in flight. A walk that outlived its key would send the rest of its pages
   // keyless (a 401 that reloads the login form) or as the next sign-in's key, mixing two actors'
-  // rows, and a page answered after logout would still finish it. Stop once the key has changed.
-  const key = sessionStorage.getItem('openwa_api_key');
+  // rows, and a page answered after logout would still finish it, even one refused with a 429 that
+  // ends the walk early with the rows in hand. Stop once the key has changed, however the page ended.
+  const actorId = getActiveApiKeyId();
+  const assertSameKey = () => {
+    if (getActiveApiKeyId() !== actorId) throw new Error('Signed out');
+  };
   const fetchOnce = async () => {
-    if (sessionStorage.getItem('openwa_api_key') !== key) throw new Error('Signed out');
-    const page = await fetchPage(pageSize, offset);
-    if (sessionStorage.getItem('openwa_api_key') !== key) throw new Error('Signed out');
-    return page;
+    assertSameKey();
+    try {
+      return await fetchPage(pageSize, offset);
+    } finally {
+      assertSameKey();
+    }
   };
   for (;;) {
     let page: Page<T>;

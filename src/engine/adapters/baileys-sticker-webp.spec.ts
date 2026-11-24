@@ -1,18 +1,19 @@
 import type { WASocket } from '@whiskeysockets/baileys';
 import { BadRequestException } from '@nestjs/common';
 import sharp from 'sharp';
-import { BaileysMessaging, MAX_STICKER_FRAMES, type BaileysMessagingHost } from './baileys-messaging';
+import { BaileysMessaging, MAX_STICKER_FRAMES, blockSvgDecoding, type BaileysMessagingHost } from './baileys-messaging';
 import { createLogger } from '../../common/services/logger.service';
+import { provesNothingSent } from '../../common/errors/engine-not-sent.error';
 
 /**
  * Baileys stamps the sticker mimetype unconditionally: `prepareWAMessageMedia` applies
  * `if (!uploadData.mimetype) uploadData.mimetype = MIMETYPE_MAP[mediaType]` with
- * `MIMETYPE_MAP.sticker = 'image/webp'` (Utils/messages.js:18, 86-88), and nothing on that path
+ * `MIMETYPE_MAP.sticker = 'image/webp'` (Utils/messages.js), and nothing on that path
  * transcodes. So whatever bytes the adapter hands over are published AS WebP whether they are WebP
  * or not — a PNG goes out labelled `image/webp` with PNG bytes, and the send reports success.
  *
  * whatsapp-web.js does not have this problem: `sendMediaAsSticker: true` routes through
- * `Util.formatToWebpSticker` (Client.js:1532, Util.js:152-159), which converts `image/*` and
+ * `Util.formatToWebpSticker` (called from `Client.sendMessage`), which converts `image/*` and
  * throws `Invalid media format` for anything else.
  *
  * These assertions are about what reaches the socket, because that is where the two engines
@@ -158,14 +159,17 @@ describe('BaileysMessaging.sendStickerMessage — what reaches the socket must r
       await expect(send).rejects.toThrow(`has ${MAX_STICKER_FRAMES + 1} frames; at most ${MAX_STICKER_FRAMES}`);
       expect(convert).not.toHaveBeenCalled();
       expect(sock.sendMessage).not.toHaveBeenCalled();
+      // Refused before anything reached WhatsApp, so a keyed send frees its Idempotency-Key.
+      expect(provesNothingSent(await send.catch((error: unknown) => error))).toBe(true);
     } finally {
       convert.mockRestore();
     }
   });
 
   // Each pipeline holds a libuv worker for its whole run; unbounded, a handful of concurrent
-  // conversions occupy the pool that fs, dns.lookup and crypto also wait on.
-  it('runs at most two conversions at once and queues the rest', async () => {
+  // conversions occupy the pool that fs, dns.lookup and crypto also wait on. The frame scan is
+  // threadpool work too, and on a GIF of tens of MB it takes seconds, so it waits for a slot as well.
+  it('runs at most two conversions at once, frame scan included, and queues the rest', async () => {
     const pending: Array<(b: Buffer) => void> = [];
     const metadata = jest.spyOn(sharp.prototype, 'metadata').mockResolvedValue({ pages: 1 });
     const convert = jest
@@ -179,10 +183,12 @@ describe('BaileysMessaging.sendStickerMessage — what reaches the socket must r
         messaging.sendStickerMessage('628111@s.whatsapp.net', { data: PNG, mimetype: 'image/png' }),
       );
       await settle();
+      expect(metadata).toHaveBeenCalledTimes(2);
       expect(convert).toHaveBeenCalledTimes(2);
 
       pending.shift()!(WEBP);
       await settle();
+      expect(metadata).toHaveBeenCalledTimes(3);
       expect(convert).toHaveBeenCalledTimes(3);
 
       pending.splice(0).forEach(resolve => resolve(WEBP));
@@ -209,5 +215,25 @@ describe('BaileysMessaging.sendStickerMessage — what reaches the socket must r
     await expect(send).rejects.toThrow(/Received 'application\/pdf'/);
     // Shipping it mislabelled is the defect; refusing after the send would not fix it.
     expect(sock.sendMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe('blockSvgDecoding', () => {
+  const SVG = Buffer.from(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8"/></svg>',
+  );
+  // The block is libvips process state: start from the default and leave it as found, so no other
+  // spec in the same worker sees it.
+  const reset = () => sharp.unblock({ operation: ['VipsForeignLoadSvg'] });
+  beforeEach(reset);
+  afterAll(reset);
+
+  it('refuses SVG input, which a sticker or an outbound image thumbnail would hand to librsvg, and still decodes a raster', async () => {
+    await expect(sharp(SVG).metadata()).resolves.toMatchObject({ format: 'svg' });
+
+    await blockSvgDecoding();
+
+    await expect(sharp(SVG).metadata()).rejects.toThrow();
+    await expect(sharp(PNG).metadata()).resolves.toMatchObject({ format: 'png' });
   });
 });

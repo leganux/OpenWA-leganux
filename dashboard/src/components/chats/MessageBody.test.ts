@@ -11,6 +11,16 @@ import { createElement } from 'react';
 import { MENTION_CLOSE, MENTION_OPEN } from '../../utils/messageFormatter.ts';
 import { buildMentionNameMap, resolveMentions } from '../../utils/chatMessages.ts';
 
+/**
+ * CPU time this process has used since `since`, in milliseconds. A bound on work is asserted on it and not on the
+ * wall clock: a busy runner can hold the worker off the CPU for longer than the whole bound, while code that is slow
+ * burns the CPU on every run.
+ */
+const cpuMsSince = (since: NodeJS.CpuUsage): number => {
+  const { user, system } = process.cpuUsage(since);
+  return (user + system) / 1000;
+};
+
 let rtl: typeof import('@testing-library/react');
 let MessageBody: (typeof import('./MessageBody.tsx'))['default'];
 
@@ -88,4 +98,42 @@ test('a backtick in a push name cannot pair with one in the body and hand the na
     assert.equal(container.querySelectorAll('bdi').length, 1, body);
     rtl.cleanup();
   }
+});
+
+test('a body past the link-scanning bound renders as plain text without being scanned', () => {
+  // The scan is skipped past the bound because Linkify's cost on an unbroken run of domain-like characters was seen to
+  // grow with the square of the run. The installed version takes about a tenth of a second on this one, so the time
+  // below is a sanity check: the URL at the end staying plain text is what shows the body was not scanned.
+  const body = `${'a.'.repeat(32_500)} https://example.com/x`;
+  const started = process.cpuUsage();
+  const { container } = rtl.render(createElement(MessageBody, { text: body }));
+  const elapsed = cpuMsSince(started);
+  assert.ok(elapsed < 1000, `rendering ${body.length} chars took ${Math.round(elapsed)} ms of CPU`);
+  assert.equal(container.querySelectorAll('a').length, 0);
+  assert.equal(container.textContent, body);
+});
+
+test('a body at the link-scanning bound is still linked', () => {
+  const url = 'https://example.com/x';
+  const body = `${url} ${'word '.repeat(1000)}`.slice(0, 4096);
+  assert.equal(body.length, 4096);
+  const { container } = rtl.render(createElement(MessageBody, { text: body }));
+  assert.equal(container.querySelector('a')?.getAttribute('href'), url);
+  rtl.cleanup();
+  const { container: past } = rtl.render(createElement(MessageBody, { text: `${body}x` }));
+  assert.equal(past.querySelectorAll('a').length, 0);
+});
+
+test('a long body of link candidates renders with no link, and without the cost of one anchor each', () => {
+  // Past the bound the body is never scanned, so thousands of bare domains stay text. Linking them, one anchor each,
+  // costs hundreds of milliseconds of CPU where the plain text costs a few: the bound sits between the two, and a
+  // process kept off the CPU does not accrue time against it.
+  const body = 'a.co '.repeat(13_000);
+  const started = process.cpuUsage();
+  const { container } = rtl.render(createElement(MessageBody, { text: body }));
+  const { user, system } = process.cpuUsage(started);
+  const cpuMs = (user + system) / 1000;
+  assert.ok(cpuMs < 250, `rendering ${body.length} chars took ${Math.round(cpuMs)} ms of CPU`);
+  assert.equal(container.querySelectorAll('a').length, 0, 'the body was scanned for links');
+  assert.equal(container.textContent, body);
 });

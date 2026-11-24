@@ -1,4 +1,4 @@
-import { In } from 'typeorm';
+import { DataSource, In } from 'typeorm';
 import { WebhookOutboxService } from './webhook-outbox.service';
 import { WebhookOutboxEvent } from './entities/webhook-outbox-event.entity';
 
@@ -12,13 +12,12 @@ const base = {
 };
 
 describe('WebhookOutboxService', () => {
-  let repo: { save: jest.Mock; create: jest.Mock; update: jest.Mock; find: jest.Mock };
+  let repo: { insert: jest.Mock; update: jest.Mock; find: jest.Mock };
   let service: WebhookOutboxService;
 
   beforeEach(() => {
     repo = {
-      create: jest.fn((v: unknown) => v),
-      save: jest.fn().mockResolvedValue(undefined),
+      insert: jest.fn().mockResolvedValue(undefined),
       update: jest.fn().mockResolvedValue(undefined),
       find: jest.fn().mockResolvedValue([]),
     };
@@ -28,12 +27,12 @@ describe('WebhookOutboxService', () => {
   it('records the delivery as pending, carrying the payload a replay needs', async () => {
     await service.open(base);
 
-    expect(repo.save).toHaveBeenCalledWith(expect.objectContaining({ ...base, state: 'pending', attempts: 0 }));
+    expect(repo.insert).toHaveBeenCalledWith(expect.objectContaining({ ...base, state: 'pending', attempts: 0 }));
   });
 
   it('treats a duplicate as the replay it is, keeping the existing row', async () => {
     const conflict = Object.assign(new Error('UNIQUE constraint failed'), { code: 'SQLITE_CONSTRAINT_UNIQUE' });
-    repo.save.mockRejectedValue(conflict);
+    repo.insert.mockRejectedValue(conflict);
 
     // A conflict on (webhookId, idempotencyKey) means this delivery is already recorded. Throwing
     // would surface as an unhandled rejection on a fire-and-forget path.
@@ -41,7 +40,7 @@ describe('WebhookOutboxService', () => {
   });
 
   it('never lets a repository failure reach a fire-and-forget caller', async () => {
-    repo.save.mockRejectedValue(new Error('disk full'));
+    repo.insert.mockRejectedValue(new Error('disk full'));
     await expect(service.open(base)).resolves.toBeUndefined();
 
     repo.update.mockRejectedValue(new Error('disk full'));
@@ -66,6 +65,17 @@ describe('WebhookOutboxService', () => {
       expect.objectContaining({ state: 'queued', deliveryId: 'job-1' }),
     );
     expect((repo.update.mock.calls as unknown[][])[0][1]).not.toHaveProperty('payload');
+  });
+
+  it('reverts a matching queued delivery back to pending without reopening settled rows', async () => {
+    await service.markPending('wh-1', 'key_wh-1', 'job-1');
+    expect(repo.update).toHaveBeenCalledWith(
+      expect.objectContaining({ webhookId: 'wh-1', idempotencyKey: 'key_wh-1', state: 'queued', deliveryId: 'job-1' }),
+      { state: 'pending' },
+    );
+
+    repo.update.mockRejectedValueOnce(new Error('disk full'));
+    await expect(service.markPending('wh-1', 'key_wh-1', 'job-1')).resolves.toBeUndefined();
   });
 
   it('returns only rows that still carry a payload: a retired row is not replayable', async () => {
@@ -104,39 +114,188 @@ describe('WebhookOutboxService', () => {
 });
 
 describe('WebhookOutboxService retention', () => {
-  let repo: { delete: jest.Mock };
+  let repo: { find: jest.Mock; delete: jest.Mock; manager: unknown };
   let service: WebhookOutboxService;
 
   beforeEach(() => {
-    repo = { delete: jest.fn().mockResolvedValue({ affected: 3 }) };
+    repo = {
+      find: jest.fn().mockResolvedValue([{ id: 'a' }, { id: 'b' }, { id: 'c' }]),
+      delete: jest.fn().mockResolvedValue({ affected: 3 }),
+      // The dialect the batched prune asks for.
+      manager: { connection: { options: { type: 'better-sqlite3' } } },
+    };
     service = new WebhookOutboxService(repo as never);
   });
 
-  it('prunes settled rows only, never one that can still be replayed', async () => {
+  it('prunes settled and legacy null-state rows in two indexed passes, never one that can still be replayed', async () => {
+    repo.find.mockResolvedValueOnce([{ id: 'a' }, { id: 'b' }]).mockResolvedValueOnce([{ id: 'c' }]);
+    repo.delete.mockResolvedValueOnce({ affected: 2 }).mockResolvedValueOnce({ affected: 1 });
+
     const removed = await service.pruneSettled(7);
 
     expect(removed).toBe(3);
-    const [[where]] = repo.delete.mock.calls as unknown as [
-      [{ state: { type: string; value: unknown }; createdAt: { type: string } }],
+    expect(repo.find).toHaveBeenCalledTimes(2);
+    const [pass1Call, pass2Call] = repo.find.mock.calls as unknown as [
+      [{ where: { state: { type: string; value?: unknown }; createdAt: { type: string } } }],
+      [{ where: { state: { type: string }; createdAt: { type: string } } }],
     ];
-    // Deleting a 'pending' row on age would discard the delivery this table exists to protect.
-    expect(where.state.type).toBe('not');
-    expect(where.state.value).toEqual(['pending', 'queued']);
-    expect(where.createdAt.type).toBe('lessThan');
+    expect(pass1Call[0].where.state.type).toBe('in');
+    expect(pass1Call[0].where.state.value).toEqual(['dispatched', 'delivered', 'failed']);
+    expect(pass1Call[0].where.createdAt.type).toBe('lessThan');
+    expect(pass2Call[0].where.state.type).toBe('isNull');
+    expect(pass2Call[0].where.createdAt.type).toBe('lessThan');
+    expect(repo.delete).toHaveBeenNthCalledWith(1, ['a', 'b']);
+    expect(repo.delete).toHaveBeenNthCalledWith(2, ['c']);
   });
 
-  it('refuses a retention window that would let the table grow without bound', () => {
+  it('prunes legacy null-state rows older than cutoff in SQLite while preserving pending, queued, and recent rows', async () => {
+    const ds = await new DataSource({
+      type: 'better-sqlite3',
+      database: ':memory:',
+      entities: [WebhookOutboxEvent],
+      synchronize: true,
+    }).initialize();
+    try {
+      const insertRow = (id: string, key: string, state: string | null, daysOld: number): Promise<unknown> =>
+        ds.query(
+          `INSERT INTO webhook_outbox_events (id, webhookId, sessionId, event, idempotencyKey, deliveryId, payload, state, attempts, createdAt)
+           VALUES (?, 'wh-1', 'sess-1', 'message.received', ?, ?, NULL, ?, 0, datetime('now', ?))`,
+          [id, key, `dlv-${key}`, state, `-${daysOld} days`],
+        );
+
+      await insertRow('00000000-0000-4000-8000-000000000001', 'old-null', null, 14);
+      await insertRow('00000000-0000-4000-8000-000000000002', 'old-dispatched', 'dispatched', 14);
+      await insertRow('00000000-0000-4000-8000-000000000003', 'old-failed', 'failed', 14);
+      await insertRow('00000000-0000-4000-8000-000000000008', 'old-delivered', 'delivered', 14);
+      await insertRow('00000000-0000-4000-8000-000000000004', 'old-pending', 'pending', 14);
+      await insertRow('00000000-0000-4000-8000-000000000005', 'old-queued', 'queued', 14);
+      await insertRow('00000000-0000-4000-8000-000000000006', 'recent-null', null, 1);
+      await insertRow('00000000-0000-4000-8000-000000000007', 'recent-dispatched', 'dispatched', 1);
+      await insertRow('00000000-0000-4000-8000-000000000009', 'recent-delivered', 'delivered', 1);
+
+      const sqliteService = new WebhookOutboxService(ds.getRepository(WebhookOutboxEvent));
+      expect(await sqliteService.pruneSettled(7)).toBe(4);
+
+      const survivors = (await ds.getRepository(WebhookOutboxEvent).find()).map(r => r.idempotencyKey).sort();
+      expect(survivors).toEqual(['old-pending', 'old-queued', 'recent-delivered', 'recent-dispatched', 'recent-null']);
+    } finally {
+      await ds.destroy();
+    }
+  });
+
+  it('awaits an in-flight prune pass during onModuleDestroy', async () => {
+    let releaseFind!: () => void;
+    repo.find.mockImplementationOnce(
+      () =>
+        new Promise(resolve => {
+          releaseFind = () => resolve([{ id: 'a' }]);
+        }),
+    );
+
+    const pruning = service.pruneSettled(7);
+    await new Promise(resolve => setImmediate(resolve));
+
+    let destroyed = false;
+    const destroyP = Promise.resolve(service.onModuleDestroy()).then(() => {
+      destroyed = true;
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(destroyed).toBe(false);
+
+    releaseFind();
+    await destroyP;
+    await pruning;
+    expect(destroyed).toBe(true);
+    // Stopped before issuing delete on the batch returned after shutdown began.
+    expect(repo.delete).not.toHaveBeenCalled();
+  });
+
+  it('bounds onModuleDestroy when a prune query hangs', async () => {
+    jest.useFakeTimers();
+    try {
+      repo.find.mockImplementationOnce(() => new Promise(() => undefined));
+
+      void service.pruneSettled(7);
+      let destroyed = false;
+      const destroyP = service.onModuleDestroy().then(() => {
+        destroyed = true;
+      });
+
+      await jest.advanceTimersByTimeAsync(999);
+      expect(destroyed).toBe(false);
+      await jest.advanceTimersByTimeAsync(1);
+      expect(destroyed).toBe(true);
+      await destroyP;
+      expect(jest.getTimerCount()).toBe(0);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('refuses a retention window that would let the table grow without bound', async () => {
     const prev = process.env.WEBHOOK_OUTBOX_RETENTION_DAYS;
     process.env.WEBHOOK_OUTBOX_RETENTION_DAYS = '0';
     try {
       service.onModuleInit();
+      await new Promise(resolve => setImmediate(resolve));
       // A settled row carries no payload and no audit value, so opting into unbounded growth buys
       // nothing: the value falls back rather than disabling the prune.
       expect(repo.delete).toHaveBeenCalled();
     } finally {
-      service.onModuleDestroy();
+      await service.onModuleDestroy();
       if (prev === undefined) delete process.env.WEBHOOK_OUTBOX_RETENTION_DAYS;
       else process.env.WEBHOOK_OUTBOX_RETENTION_DAYS = prev;
     }
+  });
+});
+
+describe('WebhookOutboxService.openBatch dialect paths', () => {
+  it('uses ON CONFLICT DO NOTHING RETURNING on drivers supporting INSERT RETURNING and filters duplicates', async () => {
+    const qb = {
+      insert: jest.fn().mockReturnThis(),
+      into: jest.fn().mockReturnThis(),
+      values: jest.fn().mockReturnThis(),
+      orIgnore: jest.fn().mockReturnThis(),
+      returning: jest.fn().mockReturnThis(),
+      updateEntity: jest.fn().mockReturnThis(),
+      execute: jest.fn().mockResolvedValue({
+        raw: [{ webhookId: 'wh-1', idempotencyKey: 'k1_wh-1' }],
+      }),
+    };
+    const manager = {
+      connection: { driver: { isReturningSqlSupported: (kind: string) => kind === 'insert' } },
+      getRepository: jest.fn().mockReturnValue({ createQueryBuilder: () => qb }),
+      createQueryBuilder: jest.fn().mockReturnValue(qb),
+    };
+    const service = new WebhookOutboxService({} as never);
+
+    const rows = [
+      { ...base, webhookId: 'wh-1', idempotencyKey: 'k1_wh-1', deliveryId: 'd1' },
+      { ...base, webhookId: 'wh-1', idempotencyKey: 'k1_wh-1', deliveryId: 'd1-dup' },
+      { ...base, webhookId: 'wh-2', idempotencyKey: 'k1_wh-2', deliveryId: 'd2' },
+    ];
+    const inserted = await service.openBatch(rows, manager as never);
+
+    expect(qb.orIgnore).toHaveBeenCalledTimes(1);
+    expect(qb.returning).toHaveBeenCalledWith(['webhookId', 'idempotencyKey']);
+    expect(qb.updateEntity).toHaveBeenCalledWith(false);
+    expect(inserted).toEqual([rows[0]]);
+  });
+
+  it('swallows non-conflict errors when called standalone without a transaction manager', async () => {
+    const qb = {
+      insert: jest.fn().mockReturnThis(),
+      into: jest.fn().mockReturnThis(),
+      values: jest.fn().mockReturnThis(),
+      orIgnore: jest.fn().mockReturnThis(),
+      updateEntity: jest.fn().mockReturnThis(),
+      execute: jest.fn().mockRejectedValue(new Error('disk full')),
+    };
+    const service = new WebhookOutboxService({
+      createQueryBuilder: () => qb,
+      manager: { connection: { driver: { isReturningSqlSupported: () => false } } },
+    } as never);
+
+    await expect(service.openBatch([base])).resolves.toBeNull();
   });
 });
